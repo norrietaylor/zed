@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stub for ps: the process table box_in_use reads ("PID PPID ARGS" lines) is
+# $FIXTURES/ps.txt; any other query goes to the real ps.
+if [ "$*" = "-xo pid=,ppid=,args=" ]; then cat "$FIXTURES/ps.txt" 2>/dev/null; exit 0; fi
+exec /bin/ps "$@"

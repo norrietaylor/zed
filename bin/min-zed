@@ -1,0 +1,1206 @@
+#!/bin/sh
+# min-zed — Minimal sessions as Zed remote projects.
+#
+# A session is named <dir>-<word> (first free word) and opened in Zed as
+# `zed ssh://min-zed.NAME/workbench`. Zed reaches the box with stock ssh whose
+# ProxyCommand (a `Host min-zed.NAME` stanza in ~/.ssh/min-zed.conf) runs an
+# OpenSSH sshd *inside* the box through `min session exec`. Zed's own remote
+# server then installs and runs in the box as on any ssh host.
+#
+# Layout: constants, then the vendored kernel block (shared by every
+# min-<client> CLI, byte for byte; see tests/kernel.sha), then the Zed layer.
+set -eu
+
+TOOL=min-zed
+# shellcheck disable=SC2034  # part of the kernel contract; the Zed layer does not read it
+CLIENT=zed
+LOADOUT=zed
+HOST_PREFIX=min-zed.
+ENV_PREFIX=MIN_ZED
+STATE=${MIN_ZED_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/min-zed}
+
+# --- kernel begin (vendored from norrietaylor/cmux; keep in sync) ---
+# Client-free plumbing: transport, keys and box facts, ssh stanzas, naming,
+# lifecycle, report helpers. Parameterised only by TOOL CLIENT LOADOUT
+# HOST_PREFIX ENV_PREFIX STATE, set before this block. The client layer
+# after it may redefine the hooks client_linked, client_on_connect and
+# client_on_destroy (no-ops here).
+
+case $HOST_PREFIX in *[!a-z0-9.-]*|''|[!a-z0-9]*|*[!.]) printf '%s: bad HOST_PREFIX %s\n' "$TOOL" "$HOST_PREFIX" >&2; exit 1 ;; esac
+# GUI clients spawn ssh with the launchd PATH; find min, jq and friends anyway.
+PATH=$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin
+SSH_KEYGEN=${SSH_KEYGEN_BIN:-ssh-keygen}
+HERDR=${HERDR_BIN:-herdr}
+eval "DEBUG=\${${ENV_PREFIX}_DEBUG:-}"
+WORDS="amber basil coral delta ember fern garnet hazel indigo jade kelp lotus maple nova olive pearl quartz rose sage teal umber violet willow xenon yarrow zinc"
+SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
+SSH_DIR=$HOME/.ssh
+SSH_CONF=$SSH_DIR/$TOOL.conf          # one `Host <prefix>NAME` stanza per session; ours
+SSH_MAIN=$SSH_DIR/config              # the user's; gets a marked Include at the top
+SSH_MARK1="# $TOOL ssh-config (remove with: $TOOL ssh-config --remove)"
+SSH_MARK2="Include ~/.ssh/$TOOL.conf"
+SSH_CREATED=$STATE/ssh-config-created # what ssh-config created under ~/.ssh
+HOST_RE=$(printf '%s' "$HOST_PREFIX" | sed 's/[.]/\\./g')   # HOST_PREFIX for grep/sed
+
+die() { printf '%s: %s\n' "$TOOL" "$*" >&2; exit 1; }
+log() { printf '[%s] %s\n' "$TOOL" "$*" >&2; }
+dbg() { [ -n "$DEBUG" ] && log "$@"; return 0; }
+
+# Client hooks; the client layer redefines the ones it needs.
+# shellcheck disable=SC2329  # a client layer may override them
+client_linked() { return 1; }      # NAME: 0 when this client's UI holds the session
+# shellcheck disable=SC2329
+client_on_connect() { :; }         # NAME: after prepare on open/attach/ssh (never _proxy)
+# shellcheck disable=SC2329
+client_on_destroy() { :; }         # NAME: the session is gone; drop client-side traces
+
+# ---- transport -------------------------------------------------------------
+
+# Absolute path of the min binary: it becomes the ssh ProxyCommand, which
+# /usr/bin/ssh runs without the user's shell functions or PATH.
+resolve_min() {
+    m=${MIN_BIN:-min}
+    case $m in
+        /*) ;;
+        *) m=$(command -v "$m" 2>/dev/null) || die "min not found on PATH (set MIN_BIN)" ;;
+    esac
+    [ -x "$m" ] || die "min is not executable: $m"
+    printf '%s' "$m"
+}
+
+# Quote one word for `sh -c` (ssh runs ProxyCommand through the shell).
+shq() {
+    case $1 in
+        '') printf "''" ;;
+        *[!A-Za-z0-9/._+:@,=-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+# Double every % so ssh's own token expansion leaves it alone.
+pct() { printf '%s' "$1" | sed 's/%/%%/g'; }
+
+mn() { "$MIN" "$@"; }
+min_ls() { mn ls --json </dev/null; }
+# sess_field NAME FIELD  (id | project_path | status | branch)
+sess_field() {
+    min_ls | jq -r --arg n "$1" --arg f "$2" '
+        .sessions[] | select(.name == $n)
+        | if $f == "branch" then (.git.branch // empty) else (.[$f] // empty) end' | head -1
+}
+sess_exists() { [ -n "$(sess_field "$1" id)" ]; }
+sess_dir() { printf '%s/sessions/%s' "$STATE" "$1"; }
+
+# ---- keys and box facts ----------------------------------------------------
+
+ensure_keypair() {
+    d=$(sess_dir "$1")
+    mkdir -p "$d" && chmod 700 "$d"
+    [ -s "$d/id_ed25519" ] && return 0
+    "$SSH_KEYGEN" -q -t ed25519 -N '' -C "$TOOL:$1" -f "$d/id_ed25519" </dev/null \
+        || die "ssh-keygen failed for $1"
+    chmod 600 "$d/id_ed25519"
+}
+
+# put FILE LINE: FILE becomes LINE (newline-terminated) in one rename, so a
+# concurrent reader never sees it half written.
+put() {
+    t=$(mktemp "$(dirname "$1")/.tmp.XXXXXX") && printf '%s\n' "$2" > "$t" && mv -f "$t" "$1"
+}
+
+# Runs inside the box via `min session exec NAME sh -c PREP TOOL PUBKEY`.
+# Prints key=value facts on stdout; anything else is an error.
+# Host key: one path shared by every min-<client> tool (~/.ssh/minx, the
+# name minx used), made under one lock protocol that every copy of this
+# kernel shares. While either half of the pair is missing, the PREP that
+# makes the .keygen dir generates into a temp name, drops any leftover half,
+# and renames the new pair into place; everyone else waits for both files.
+# Only that PREP removes the dir. Waiters give up after 5s (MIN_KEYGEN_WAIT:
+# a test knob, min does not forward host env) leaving the dir alone. A dir
+# over a minute old (owner died) is broken by one waiter at a time, under
+# .keygen.break, which is itself cleared when over a minute old; without
+# `find -mmin` neither is ever broken.
+# authorized_keys: per tool, ~/.ssh/TOOL/authorized_keys ($0), so tools never
+# rewrite each other's file.
+# shellcheck disable=SC2016
+PREP='set -eu
+umask 077
+d="$HOME/.ssh/minx"; k="$d/host_ed25519"; l="$d/.keygen"; a="$HOME/.ssh/$0"
+mkdir -p "$HOME/.ssh" "$d" "$a"
+command -v ssh-keygen >/dev/null 2>&1 || { echo "openssh is not installed in this session; activate it with the $0 loadout" >&2; exit 3; }
+unlock() { rm -f "$t" "$t.pub"; rmdir "$l" 2>/dev/null || true; }
+old() { [ -n "$(find "$1" -prune -mmin +1 2>/dev/null)" ]; }
+i=0
+while [ ! -s "$k" ] || [ ! -s "$k.pub" ]; do
+  if mkdir "$l" 2>/dev/null; then
+    t="$d/.new.$$"; trap unlock EXIT; trap "exit 1" HUP INT TERM
+    if [ ! -s "$k" ] || [ ! -s "$k.pub" ]; then
+      rm -f "$t" "$t.pub"
+      ssh-keygen -q -t ed25519 -N "" -C "min host" -f "$t" </dev/null >&2
+      rm -f "$k" "$k.pub"
+      mv -f "$t" "$k"; mv -f "$t.pub" "$k.pub"
+    fi
+    trap - EXIT HUP INT TERM; unlock
+    break
+  fi
+  if old "$l.break"; then rmdir "$l.break" 2>/dev/null || true; fi
+  if old "$l" && mkdir "$l.break" 2>/dev/null; then
+    ! old "$l" || rm -rf "$l"
+    rmdir "$l.break"; continue
+  fi
+  [ "$i" -lt "${MIN_KEYGEN_WAIT:-5}" ] || { echo "host key generation did not finish in $d ($l is held)" >&2; exit 3; }
+  sleep 1; i=$((i + 1))
+done
+printf "%s\n" "$1" > "$a/authorized_keys.$$" && mv -f "$a/authorized_keys.$$" "$a/authorized_keys"
+env | grep -E "^[A-Za-z_][A-Za-z0-9_]*=" | grep -Ev "^(TERM|PWD|OLDPWD|SHLVL|_|HOME|USER|LOGNAME|PATH|SSH_[A-Z_]*|PROMPT_COMMAND|MINIMAL_MOTD)=" > "$HOME/.ssh/environment.$$" || true
+mv -f "$HOME/.ssh/environment.$$" "$HOME/.ssh/environment"
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  grep -Eqs "(minx|min):workbench" "$rc" || printf "%s\n" "# min:workbench (managed by $0)" "case \$- in *i*) if [ \"\$PWD\" = \"\$HOME\" ] && [ -d /workbench ]; then cd /workbench; fi ;; esac" >> "$rc"
+done
+[ -e "$HOME/.bash_profile" ] || printf "%s\n" "[ -f \"\$HOME/.bashrc\" ] && . \"\$HOME/.bashrc\"" > "$HOME/.bash_profile"
+echo "user=$(id -un)"
+echo "home=$HOME"
+echo "sshd=$(command -v sshd 2>/dev/null || echo /usr/sbin/sshd)"
+echo "hostkey=$(cut -d" " -f1-2 "$d/host_ed25519.pub")"'
+
+# prepare NAME: key on the host, pubkey + host key in the box, facts on disk.
+# Sets $F_USER $F_HOME $F_SSHD.
+prepare() {
+    ensure_keypair "$1"
+    d=$(sess_dir "$1")
+    pub=$(cat "$d/id_ed25519.pub")
+    facts=$(mn session exec "$1" sh -c "$PREP" "$TOOL" "$pub" </dev/null) \
+        || die "could not prepare session $1 (is it active, with openssh installed?)"
+    F_USER=$(printf '%s\n' "$facts" | sed -n 's/^user=//p' | head -1)
+    F_HOME=$(printf '%s\n' "$facts" | sed -n 's/^home=//p' | head -1)
+    F_SSHD=$(printf '%s\n' "$facts" | sed -n 's/^sshd=//p' | head -1)
+    hostkey=$(printf '%s\n' "$facts" | sed -n 's/^hostkey=//p' | head -1)
+    [ -n "$F_USER" ] && [ -n "$F_HOME" ] && [ -n "$hostkey" ] \
+        || die "session $1 returned incomplete facts: $(printf '%s' "$facts" | LC_ALL=C tr -c '[:print:]\n' '?' | head -c 400)"
+    : "${F_SSHD:=/usr/sbin/sshd}"
+    # The box is untrusted: these land in ssh_config (User expands %tokens
+    # and ${ENV}) and in the ProxyCommand. Check all before writing any.
+    fact_ok "$USER_ERE" "$F_USER" || bad_fact "$1" user "$F_USER"
+    fact_ok 'ssh-ed25519 [A-Za-z0-9+/]+=*' "$hostkey" || bad_fact "$1" hostkey "$hostkey"
+    fact_ok "$PATH_ERE" "$F_HOME" || bad_fact "$1" home "$F_HOME"
+    fact_ok "$PATH_ERE" "$F_SSHD" || bad_fact "$1" sshd "$F_SSHD"
+    umask 077
+    put "$d/known_hosts" "$HOST_PREFIX$1 $hostkey"
+    put "$d/user" "$F_USER"
+    put "$d/home" "$F_HOME"
+    put "$d/sshd" "$F_SSHD"
+    ssh_config_write
+}
+
+# What a box may report. Paths: no space (sshd's AuthorizedKeysFile splits on
+# it), no quoting or %/$ expansion, no control bytes (proxy_command's
+# \001/\002 sentinels among them).
+USER_ERE='[A-Za-z_][A-Za-z0-9._-]{0,31}'
+PATH_ERE='/[A-Za-z0-9._/+@-]*'
+# fact_ok ERE VALUE: VALUE is one line matching ERE in full (C locale).
+fact_ok() {
+    case $2 in *"
+"*) return 1 ;; esac
+    printf '%s\n' "$2" | LC_ALL=C grep -Eqx -- "$1"
+}
+# bad_fact NAME FIELD VALUE: die naming the field; VALUE cut to 40 printable bytes.
+bad_fact() {
+    v=$(printf '%s' "$3" | LC_ALL=C tr -c '[:print:]' '?' | cut -c1-40)
+    die "session $1 reported an invalid $2 ($v); not trusting it"
+}
+
+# sshd argv, one word per line. $1 sshd path, $2 box home.
+sshd_argv() {
+    printf '%s\n' "$1" -i -e -f /dev/null -h "$2/.ssh/minx/host_ed25519" \
+        -o LogLevel=ERROR -o PidFile=none -o StrictModes=no \
+        -o PubkeyAuthentication=yes -o PasswordAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o "AuthorizedKeysFile $2/.ssh/$TOOL/authorized_keys" \
+        -o PermitUserEnvironment=yes -o AllowTcpForwarding=yes -o GatewayPorts=no \
+        -o AllowAgentForwarding=no -o X11Forwarding=no -o PrintMotd=no -o PrintLastLog=no -o UseDNS=no \
+        -o "Subsystem sftp internal-sftp"
+}
+
+# ---- ssh -------------------------------------------------------------------
+
+# The direct ProxyCommand string for NAME (facts from disk).
+proxy_command() {
+    d=$(sess_dir "$1")
+    sshd=$(cat "$d/sshd"); home=$(cat "$d/home")
+    cmd="$(shq "$MIN") session exec $(shq "$1")"
+    set -f
+    for w in $(sshd_argv "$sshd" "$home" | tr '\n' '\001' | tr ' ' '\002' | tr '\001' ' '); do
+        w=$(printf '%s' "$w" | tr '\002' ' ')
+        cmd="$cmd $(shq "$w")"
+    done
+    set +f
+    pct "$cmd"
+}
+
+# ssh_common NAME FMT: the client options every path to NAME carries, as
+# `FMT KEY VALUE [path]`. Forwarding is off here, not left to ~/.ssh/config:
+# TOOL.conf is Included first, so a later `Host *` with `ForwardAgent yes`
+# would otherwise hand the agent to the box.
+ssh_common() {
+    d=$(sess_dir "$1")
+    $2 User "$(cat "$d/user")"
+    $2 IdentitiesOnly yes
+    $2 AddKeysToAgent no
+    $2 UserKnownHostsFile "$d/known_hosts" path
+    $2 StrictHostKeyChecking yes
+    $2 ForwardAgent no
+    $2 ForwardX11 no
+    $2 ForwardX11Trusted no
+}
+
+# KEY=VALUE for ssh -o; a path is quoted only when it has whitespace.
+opt_kv() {
+    v=$2
+    if [ "${3:-}" = path ]; then
+        case $v in *[[:space:]]*) v="\"$v\"" ;; esac
+        v=$(pct "$v")
+    fi
+    printf '%s=%s\n' "$1" "$v"
+}
+
+# ssh -o options for NAME, one per line.
+ssh_opts() {
+    d=$(sess_dir "$1")
+    fact_ok "$USER_ERE" "$(cat "$d/user")" || die "session $1: invalid user in $d/user; not using it"
+    printf '%s\n' "ProxyCommand=$(proxy_command "$1")"
+    ssh_common "$1" opt_kv
+}
+
+# The path baked into stanzas: ~/.local/bin/TOOL when that symlink is this
+# file (a moved checkout then keeps working), else this file.
+self_path() {
+    p=$HOME/.local/bin/$TOOL
+    if [ -L "$p" ]; then
+        l=$(readlink "$p"); case $l in /*) ;; *) l=$(dirname "$p")/$l ;; esac
+        if [ -f "$l" ] && [ "$(cd "$(dirname "$l")" && pwd -P)/$(basename "$l")" = "$(cd "$(dirname "$SELF")" && pwd -P)/$(basename "$SELF")" ]; then
+            printf '%s' "$p"; return 0
+        fi
+    fi
+    printf '%s' "$SELF"
+}
+
+# One stanza line; a path is always quoted and %-doubled.
+stanza_kv() {
+    if [ "${3:-}" = path ]; then printf '    %s "%s"\n' "$1" "$(pct "$2")"
+    else printf '    %s %s\n' "$1" "$2"; fi
+}
+
+# ssh_stanza NAME: a `Host <prefix>NAME` block from the facts prepare wrote.
+ssh_stanza() {
+    d=$(sess_dir "$1")
+    mb=; [ -z "$MIN" ] || mb="MIN_BIN=$(shq "$MIN") "
+    printf '# %s\nHost %s%s\n' "$1" "$HOST_PREFIX" "$1"
+    ssh_common "$1" stanza_kv
+    stanza_kv IdentityFile "$d/id_ed25519" path
+    printf '    ProxyCommand %s\n' "$(pct "env ${mb}${ENV_PREFIX}_STATE_DIR=$(shq "$STATE") $(shq "$(self_path)") _proxy $(shq "$1")")"
+}
+
+# The whole TOOL.conf: header, a stanza per session on disk (only those min
+# still lists, when min is around), then a catch-all that explains itself.
+ssh_stanzas() {
+    printf '# managed by %s ssh-config; do not edit\n' "$TOOL"
+    live=; filter=
+    if [ -n "$MIN" ] && ls_json=$(min_ls 2>/dev/null); then
+        live=$(printf '%s\n' "$ls_json" | jq -r '.sessions[].name'); filter=1
+    fi
+    for s in "$STATE"/sessions/*/; do
+        [ -f "${s}user" ] || continue
+        n=$(basename "$s")
+        valid_name "$n" || { log "skipping $n: not a valid stanza name"; continue; }
+        fact_ok "$USER_ERE" "$(cat "${s}user")" || { log "skipping $n: invalid user in ${s}user"; continue; }
+        if [ -n "$filter" ]; then printf '%s\n' "$live" | grep -qxF -- "$n" || continue; fi
+        printf '\n'; ssh_stanza "$n"
+    done
+    printf '\nHost %s* !%s*.*\n    ProxyCommand %s\n' "$HOST_PREFIX" "$HOST_PREFIX" \
+        "$(pct "env ${ENV_PREFIX}_STATE_DIR=$(shq "$STATE") $(shq "$(self_path)") _proxy --missing")"
+}
+
+# Stanzas in TOOL.conf (the catch-all is not one).
+ssh_stanza_count() { grep -c "^Host ${HOST_RE}[^*]" "$SSH_CONF" 2>/dev/null || :; }
+
+# Refresh TOOL.conf. A no-op until `TOOL ssh-config` has created it, and
+# never fatal: it runs on the way to a connection.
+ssh_config_write() {
+    [ -e "$SSH_CONF" ] || return 0
+    case $STATE in *'"'*) log "state dir path contains a double quote; not writing $SSH_CONF"; return 0 ;; esac
+    ssh_config_put || log "could not write $SSH_CONF; leaving it as it was"
+    return 0
+}
+# TOOL.conf from ssh_stanzas: tmp + rename, mode 600; left alone (same
+# inode, same mtime) when the content is unchanged.
+ssh_config_put() {
+    tmp=$(mktemp "$SSH_CONF.XXXXXX") || return 1
+    ssh_stanzas > "$tmp" || { rm -f "$tmp"; return 1; }
+    if cmp -s "$tmp" "$SSH_CONF"; then rm -f "$tmp"; chmod 600 "$SSH_CONF"; return 0; fi
+    { chmod 600 "$tmp" && mv -f "$tmp" "$SSH_CONF"; } || { rm -f "$tmp"; return 1; }
+}
+
+# ssh-config [--remove|--print]: create ~/.ssh/TOOL.conf and put a marked
+# Include of it at the top of ~/.ssh/config, written through (often a
+# dotfiles symlink). What install created (`dir`, `config`) is recorded in
+# $SSH_CREATED, so --remove deletes only those.
+cmd_ssh_config() {
+    case ${1:-} in
+        '') ;;
+        --print) ssh_stanzas; return 0 ;;
+        --remove) ssh_config_remove; return 0 ;;
+        *) die "ssh-config: unknown option $1" ;;
+    esac
+    case $STATE in *'"'*) die "state dir path contains a double quote; not writing $SSH_CONF" ;; esac
+    mkdir -p "$STATE"
+    created=
+    [ -d "$SSH_DIR" ] || { mkdir -p "$SSH_DIR" && chmod 700 "$SSH_DIR"; created=dir; }
+    [ -e "$SSH_CONF" ] || { : > "$SSH_CONF"; chmod 600 "$SSH_CONF"; }
+    if ! grep -qxF -- "$SSH_MARK2" "$SSH_MAIN" 2>/dev/null; then
+        [ -e "$SSH_MAIN" ] || { : > "$SSH_MAIN"; chmod 600 "$SSH_MAIN"; created="$created config"; }
+        rm -f "$SSH_CREATED"
+        for w in $created; do printf '%s\n' "$w" >> "$SSH_CREATED"; done
+        tmp=$(mktemp "$SSH_MAIN.XXXXXX") || die "cannot write $SSH_MAIN"
+        { printf '%s\n' "$SSH_MARK1" "$SSH_MARK2"; cat "$SSH_MAIN"; } > "$tmp"
+        ssh_main_write "$tmp" || { rm -f "$tmp"; die "cannot write $SSH_MAIN"; }
+        rm -f "$tmp"
+        log "added \`$SSH_MARK2\` to the top of $SSH_MAIN"
+    fi
+    ssh_config_put || die "cannot write $SSH_CONF"
+    log "$SSH_CONF: $(ssh_stanza_count) stanza(s); ssh ${HOST_PREFIX}NAME reaches a session"
+}
+
+# ssh_main_write FILE: ~/.ssh/config becomes FILE's content, written
+# through, after a dated copy of its old content under $STATE/backups.
+ssh_main_write() {
+    (umask 077; mkdir -p "$STATE/backups") && chmod 700 "$STATE/backups" || return 1
+    b=$STATE/backups/ssh_config.$(date +%Y%m%dT%H%M%S); i=1; bb=$b
+    while [ -e "$bb" ]; do bb=$b.$i; i=$((i + 1)); done
+    { (umask 077; cat "$SSH_MAIN" > "$bb") && chmod 600 "$bb"; } || { log "cannot back up $SSH_MAIN to $bb"; return 1; }
+    log "backed up $SSH_MAIN to $bb"
+    cat "$1" > "$SSH_MAIN" && return 0
+    log "writing $SSH_MAIN failed; its previous content is in $bb"
+    if cat "$bb" > "$SSH_MAIN"; then log "restored $SSH_MAIN from $bb"
+    else log "could not restore $SSH_MAIN; copy $bb back by hand"; fi
+    return 1
+}
+
+# Drop every marker + Include pair from ~/.ssh/config (the rest byte for
+# byte) in one write, delete TOOL.conf, and the config file and ~/.ssh too
+# when install created them and they are now empty (a symlinked config never).
+ssh_config_remove() {
+    removed=
+    if grep -qxF -- "$SSH_MARK2" "$SSH_MAIN" 2>/dev/null; then
+        tmp=$(mktemp "$SSH_MAIN.XXXXXX") || die "cannot write $SSH_MAIN"
+        cat "$SSH_MAIN" > "$tmp"
+        while n=$(grep -nxF -- "$SSH_MARK2" "$tmp" | head -1 | cut -d: -f1) && [ -n "$n" ]; do
+            m=$n
+            [ "$n" -gt 1 ] && [ "$(sed -n "$((n - 1))p" "$tmp")" = "$SSH_MARK1" ] && m=$((n - 1))
+            { { [ "$m" -le 1 ] || head -n $((m - 1)) "$tmp"; tail -n +$((n + 1)) "$tmp"; } > "$tmp.next" \
+                && mv -f "$tmp.next" "$tmp"; } || { rm -f "$tmp" "$tmp.next"; die "cannot write $SSH_MAIN"; }
+        done
+        ssh_main_write "$tmp" || { rm -f "$tmp"; die "cannot write $SSH_MAIN"; }
+        rm -f "$tmp"
+        removed=1
+    fi
+    if [ -n "$removed" ]; then log "removed the $TOOL Include from $SSH_MAIN"
+    else log "no $TOOL Include found in $SSH_MAIN"; fi
+    rm -f "$SSH_CONF"
+    if grep -qx config "$SSH_CREATED" 2>/dev/null \
+        && [ -f "$SSH_MAIN" ] && [ ! -L "$SSH_MAIN" ] && [ ! -s "$SSH_MAIN" ]; then
+        rm -f "$SSH_MAIN"; log "removed the now empty $SSH_MAIN"
+    fi
+    if grep -qx dir "$SSH_CREATED" 2>/dev/null && rmdir "$SSH_DIR" 2>/dev/null; then
+        log "removed the now empty $SSH_DIR"
+    fi
+    rm -f "$SSH_CREATED"
+}
+
+# _proxy NAME: the ProxyCommand behind a `Host <prefix>NAME` stanza.
+# `_proxy --missing` is the catch-all's and takes no host, so no hostname
+# reaches a shell. Prepares the session (host key re-pinned, pubkey
+# re-pushed), then becomes sshd in the box. Stdout is the ssh byte stream:
+# nothing is printed before the exec; outcomes go to $STATE/proxy.log.
+cmd_proxy() {
+    if [ "${1:-}" = --missing ]; then
+        die "no $TOOL ssh stanza for this $HOST_PREFIX* host; run: $TOOL status, then $TOOL attach NAME (or $TOOL ssh-config)"
+    fi
+    name=${1:-}; [ -n "$name" ] || die "_proxy: NAME required"
+    sess_exists "$name" || { proxy_log "$name" "fail: no session named $name"; die "no session named $name"; }
+    (prepare "$name") || { proxy_log "$name" "fail: prepare"; exit 1; }
+    d=$(sess_dir "$name")
+    set --
+    while IFS= read -r w; do set -- "$@" "$w"; done <<EOT
+$(sshd_argv "$(cat "$d/sshd")" "$(cat "$d/home")")
+EOT
+    proxy_log "$name" ok
+    exec "$MIN" session exec "$name" "$@"
+}
+# proxy_log NAME WHAT: one dated line in $STATE/proxy.log (mode 600; past
+# 1000 lines only the newest 500 are kept). Silent and never fails.
+proxy_log() {
+    (
+        f=$STATE/proxy.log; umask 077
+        printf '%s %s %s\n' "$(date '+%FT%T')" "$1" "$2" >> "$f"
+        chmod 600 "$f"
+        [ "$(($(wc -l < "$f")))" -le 1000 ] || { tail -n 500 "$f" > "$f.$$" && mv -f "$f.$$" "$f"; } || rm -f "$f.$$"
+    ) >/dev/null 2>&1 || true
+}
+
+# ssh NAME [-- ARGS...]: plain ssh into the session over the same transport.
+cmd_ssh() {
+    name=${1:-}; [ -n "$name" ] || die "ssh: NAME required"
+    shift
+    [ "${1:-}" = "--" ] && shift
+    sess_exists "$name" || die "no session named $name"
+    prepare "$name"
+    client_on_connect "$name"
+    d=$(sess_dir "$name")
+    tmp=$(mktemp) && ssh_opts "$name" > "$tmp"
+    set -- "$HOST_PREFIX$name" "$@"
+    while IFS= read -r o; do set -- -o "$o" "$@"; done < "$tmp"
+    rm -f "$tmp"
+    exec ssh -i "$d/id_ed25519" "$@"
+}
+
+# ---- naming ----------------------------------------------------------------
+
+# slug STR: lowercased, runs outside [a-z0-9-] squeezed to one -, trimmed.
+slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed 's/^-//; s/-$//'; }
+
+# valid_name NAME: lowercase letters, digits and dashes, not starting with a
+# dash: anything else breaks a `Host` pattern or a stanza comment.
+valid_name() {
+    case $1 in ''|-*) return 1 ;; esac
+    [ "$(printf '%s.' "$1" | LC_ALL=C tr -d 'a-z0-9-')" = . ]
+}
+
+# next_name PATH: <dir>-<word>, the first word no session has taken.
+next_name() {
+    s=$(slug "$(basename "$1")"); base=${s:-session}
+    taken=$(min_ls | jq -r '.sessions[].name')
+    nn=1
+    while :; do
+        for w in $WORDS; do
+            [ "$nn" = 1 ] || w=$w$nn
+            printf '%s\n' "$taken" | grep -qxF -- "$base-$w" || { printf '%s\n' "$base-$w"; return; }
+        done
+        nn=$((nn + 1))
+    done
+}
+
+# pick_session CMD: numbered picker on the terminal; prints the chosen name.
+pick_session() {
+    [ -t 0 ] || die "$1: NAME required when stdin is not a terminal"
+    min_ls | jq -r '.sessions[] | [.name, .status, (.project_path // "")] | @tsv' \
+        | awk -F'\t' '{ printf "%2d) %-28s %-13s %s\n", NR, $1, $2, $3 }' >&2
+    printf 'session number: ' >&2
+    read -r pn
+    case $pn in ''|*[!0-9]*|0) die "no such entry" ;; esac
+    pn=$(min_ls | jq -r --argjson n "$pn" '.sessions[$n - 1].name // empty') \
+        || die "no such entry"
+    [ -n "$pn" ] || die "no such entry"
+    printf '%s\n' "$pn"
+}
+
+# activate_session NAME PATH: a new session with this tool's loadout. An
+# explicit --loadout makes min ignore default_loadouts.
+activate_session() {
+    mn session activate --no-prompt --loadout "$LOADOUT" -n "$1" "$2"
+    sess_exists "$1" || die "activate made no session $1"
+}
+
+# ---- lifecycle ---------------------------------------------------------------
+
+# min destroys a session with no unsaved changes without asking, so ask here
+# first (default No). ask_destroy NAME CHOICES prints the answer.
+ask_destroy() {
+    printf 'Destroy Minimal session %s (%s)? [%s] ' "$1" "$(sess_field "$1" project_path)" "$2" >&2
+    IFS= read -r a || a=
+    printf '%s' "$a"
+}
+
+# destroy_one NAME ANSWER: destroy on y, else keep (kept/NAME snoozes it).
+# Returns min's exit status.
+destroy_one() {
+    r=0
+    case $2 in
+        y|Y|yes|YES) mn session destroy "$1" || r=$? ;;
+        *) log "kept $1"; mkdir -p "$STATE/kept"; date +%s > "$STATE/kept/$1" ;;
+    esac
+    if ! sess_exists "$1"; then
+        rm -rf "$(sess_dir "$1")" "$STATE/orphan/$1" "$STATE/kept/$1"
+        client_on_destroy "$1"
+    fi
+    ssh_config_write
+    return "$r"
+}
+
+# box_in_use NAME: a host process runs `session exec NAME ... sshd` (any
+# tool's _proxy, cmux's ssh, ControlPersist masters, ssh2 clients). One whose
+# parent is Herdr's `remote-client-bridge` ssh (the open Herdr app bridges to
+# every saved machine) counts only while `herdr --machine DEST agent list`
+# lists an agent, asked at most once a minute. Reads ps only: never starts
+# or contacts a box.
+box_in_use() {
+    bu_hits=$(ps -xo pid=,ppid=,args= 2>/dev/null | awk -v n="$1" '
+        { a = $0; sub(/^[ \t]*[0-9]+[ \t]+[0-9]+[ \t]*/, "", a); args[$1] = a; par[$1] = $2; ord[NR] = $1 }
+        END {
+            for (r = 1; r <= NR; r++) {
+                p = ord[r]; k = split(args[p], w, /[ \t]+/); at = 0; sshd = 0
+                for (i = 1; i + 2 <= k; i++) if (w[i] == "session" && w[i + 1] == "exec" && w[i + 2] == n) { at = i + 3; break }
+                if (!at) continue
+                for (i = at; i <= k; i++) if (w[i] ~ /(^|\/)sshd$/) { sshd = 1; break }
+                if (!sshd) continue
+                q = args[par[p]]
+                if (q !~ / remote-client-bridge( |$)/) { print "ssh"; continue }
+                m = split(q, v, /[ \t]+/); dest = "-"
+                for (i = 1; i <= m; i++) { x = v[i]; sub(/^.*@/, "", x)
+                    if (length(x) > length(n) + 1 && substr(x, length(x) - length(n)) == "." n) { dest = x; break } }
+                print "herdr", dest
+            }
+        }' | sort -u)
+    [ -n "$bu_hits" ] || return 1
+    printf '%s\n' "$bu_hits" | grep -qx ssh && return 0
+    command -v "$HERDR" >/dev/null 2>&1 || return 1
+    bu_now=$(date +%s)
+    mkdir -p "$STATE/herdr.agents"
+    bu_f=$STATE/herdr.agents/$1
+    read -r bu_at bu_count 2>/dev/null < "$bu_f" || { bu_at=0 bu_count=0; }
+    if [ $((bu_now - bu_at)) -ge 60 ]; then
+        bu_count=0
+        for bu_d in $(printf '%s\n' "$bu_hits" | awk '$1 == "herdr" { print $2 }'); do
+            case $bu_d in *[!a-z0-9.-]*|-) continue ;; esac
+            c=$("$HERDR" --machine "$bu_d" agent list </dev/null 2>/dev/null \
+                | jq -r '.result.agents | if type == "array" then length else empty end' 2>/dev/null)
+            case $c in ''|*[!0-9]*) c=0 ;; esac
+            bu_count=$((bu_count + c))
+        done
+        printf '%s %s\n' "$bu_now" "$bu_count" > "$bu_f"
+    fi
+    [ "${bu_count:-0}" != 0 ]
+}
+
+# track_orphans LS_JSON NOW: orphan/NAME = epoch an active session in LS_JSON
+# (the client passes the sessions it owns) was first seen neither linked to
+# the client nor in use; a session in use or linked loses its date, so its
+# age counts from the last use. orphan/, kept/ and herdr.agents/ entries of
+# sessions LS_JSON no longer lists are dropped.
+track_orphans() {
+    mkdir -p "$STATE/orphan" "$STATE/kept"
+    to_active=$(printf '%s' "$1" | jq -r '.sessions[] | select(.status == "active") | .name')
+    to_all=$(printf '%s' "$1" | jq -r '.sessions[].name')
+    to_orphans=
+    for to_n in $to_active; do
+        valid_name "$to_n" || continue
+        if client_linked "$to_n" || box_in_use "$to_n"; then rm -f "$STATE/orphan/$to_n"; continue; fi
+        to_orphans="$to_orphans$to_n
+"
+        [ -f "$STATE/orphan/$to_n" ] || printf '%s' "$2" > "$STATE/orphan/$to_n"
+    done
+    for to_f in "$STATE"/orphan/* "$STATE"/kept/* "$STATE"/herdr.agents/*; do
+        [ -f "$to_f" ] || continue
+        to_n=${to_f##*/}
+        case $to_f in
+            "$STATE"/orphan/*) printf '%s' "$to_orphans" | grep -qxF -- "$to_n" || rm -f "$to_f" ;;
+            *) printf '%s\n' "$to_all" | grep -qxF -- "$to_n" || rm -f "$to_f" ;;
+        esac
+    done
+}
+
+# ---- report ------------------------------------------------------------------
+
+# TSV on stdin -> space-aligned columns.
+table() {
+    awk -F'\t' '{ for (i = 1; i <= NF; i++) { c[NR, i] = $i; if (length($i) > w[i]) w[i] = length($i) } nf[NR] = NF }
+        END { for (r = 1; r <= NR; r++) { s = ""
+                  for (i = 1; i < nf[r]; i++) s = s sprintf("%-" w[i] "s  ", c[r, i])
+                  print s c[r, nf[r]] } }'
+}
+
+# row LEVEL CHECK MESSAGE [FIX]: one doctor line; counts FAILs in $FAILS.
+row() {
+    printf '%-4s  %-11s  %s\n' "$1" "$2" "$3"
+    [ "$1" = ok ] || [ -z "${4:-}" ] || printf '%19s%s\n' '' "$4"
+    [ "$1" != FAIL ] || FAILS=$((FAILS + 1))
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# 45m / 3h / 2d
+humanise_age() {
+    if [ "$1" -ge 86400 ]; then echo "$(($1 / 86400))d"
+    elif [ "$1" -ge 3600 ]; then echo "$(($1 / 3600))h"
+    else echo "$(($1 / 60))m"; fi
+}
+# --- kernel end ---
+
+# ==== Zed client layer ========================================================
+# Coded only against the kernel contract (~/code/min-clients/KERNEL.md).
+
+ZED=${ZED_BIN:-zed}
+OSASCRIPT=${OSASCRIPT_BIN:-osascript}
+INTERVAL=${MIN_ZED_INTERVAL:-5}
+PREFETCH=${MIN_ZED_PREFETCH:-0}            # 1: fetch Zed's remote server into the box on open/new (UNVERIFIED, spike Z1)
+ZED_SETTINGS=${MIN_ZED_SETTINGS:-$HOME/.config/zed/settings.json}
+ZED_CONFIGURED=$STATE/zed-config-installed # written by `zed-config`: the opt-in for settings sync
+ZED_TESTED=1.22.0
+STATE_FILE=.min-zed/agent-state            # under the box's $HOME, written by the loadout's Claude hook
+
+usage() {
+    cat <<'USAGE'
+usage: min-zed <command> [args]
+
+  open [PATH] [-n NAME]   open PATH's session in Zed (ssh://min-zed.NAME/workbench); reuses a live
+                          min-zed session for PATH, else activates one with the zed loadout
+  new [PATH] [-n NAME]    always activate a fresh session for PATH (default .), then open it in Zed
+  attach [NAME]           open an existing session in Zed (no NAME: pick one)
+  destroy [-y] [NAME]     destroy a session after a y/N prompt (-y skips it); no NAME: this directory's
+  gc [--older-than SECONDS] [--dry-run]
+                          list min-zed sessions nothing is connected to, then ask y/N/q to destroy each
+  status                  table of sessions: status, project, in use, agent state, idle age
+  doctor                  health report (ok / warn / FAIL with a fix); exits 1 on any FAIL
+  watch [--ensure|--stop] host loop: macOS notifications when Claude in a connected box needs input or finishes
+  ssh NAME [-- ARGS...]   plain ssh into the session over the same transport (debugging: -- -v)
+  ssh-config [--remove|--print]
+                          Host min-zed.NAME stanzas in ~/.ssh/min-zed.conf (Zed connects through them)
+  zed-config [--remove|--print]
+                          keep Zed's ssh_connections in step with live sessions (opt-in)
+  completions <zsh|bash>  print a completion script (install: eval "$(min-zed completions zsh)")
+USAGE
+}
+
+# Where this checkout's files live (~/.local/bin/min-zed is a link into it).
+src_dir() {
+    sd=$SELF
+    while [ -L "$sd" ]; do
+        sl=$(readlink "$sd"); case $sl in /*) sd=$sl ;; *) sd=$(dirname "$sd")/$sl ;; esac
+    done
+    dirname "$sd"
+}
+
+# own_ls: min ls --json narrowed to the sessions this tool has prepared (a
+# key dir under $STATE/sessions). Other tools' boxes are theirs to tidy.
+own_ls() {
+    ol_mine=$(for s in "$STATE"/sessions/*/; do [ -d "$s" ] && basename "$s"; done)
+    min_ls | jq --arg m "$ol_mine" '($m | split("\n")) as $k | .sessions |= map(select(.name as $n | $k | index([$n])))'
+}
+
+# ---- Zed settings (ssh_connections) -------------------------------------------
+
+# zed_names: own live sessions, one per line; fails when min ls does.
+zed_names() { own_ls | jq -r '.sessions[].name'; }
+
+# zed_sync: make Zed's min-zed.* ssh_connections exactly the live sessions.
+# A no-op until `zed-config` has opted in; never fatal (it runs on the way to
+# a connection) and never from _proxy.
+zed_sync() {
+    [ -f "$ZED_CONFIGURED" ] || return 0
+    zs_names=$(zed_names 2>/dev/null) || { log "min ls failed; Zed settings left as they were"; return 0; }
+    # shellcheck disable=SC2086  # names are valid_name words
+    python3 "$(src_dir)/min-zed-config" --quiet --settings "$ZED_SETTINGS" --backup-dir "$STATE/backups" $zs_names </dev/null \
+        || log "could not update $ZED_SETTINGS; see min-zed doctor"
+    return 0
+}
+
+client_on_connect() { zed_sync; }
+client_on_destroy() { rm -f "$STATE/cache/$1.agent"; zed_sync; }
+
+# zed-config [--remove|--print]: opt in to (or out of) settings sync.
+cmd_zed_config() {
+    cfg=$(src_dir)/min-zed-config
+    case ${1:-} in
+        --remove)
+            python3 "$cfg" --remove --settings "$ZED_SETTINGS" --backup-dir "$STATE/backups" </dev/null || exit 1
+            rm -f "$ZED_CONFIGURED"; return 0 ;;
+        --print|'') ;;
+        *) die "zed-config: unknown option $1" ;;
+    esac
+    [ -n "$MIN" ] || die "min not found; cannot list sessions (set MIN_BIN)"
+    names=$(zed_names) || die "min ls failed"
+    if [ "${1:-}" = --print ]; then
+        # shellcheck disable=SC2086
+        python3 "$cfg" --dry-run --settings "$ZED_SETTINGS" $names </dev/null; return 0
+    fi
+    mkdir -p "$STATE"
+    # shellcheck disable=SC2086
+    python3 "$cfg" --settings "$ZED_SETTINGS" --backup-dir "$STATE/backups" $names </dev/null || exit 1
+    : > "$ZED_CONFIGURED"
+}
+
+# ---- Zed remote server pre-fetch (UNVERIFIED: spike Z1) -----------------------
+
+# zed_version: "CHANNEL VERSION" from `zed --version` ("Zed 1.22.0 – /Applications/Zed.app";
+# a Preview build says "Zed Preview X.Y.Z"), or nothing.
+zed_version() {
+    "$ZED" --version </dev/null 2>/dev/null | awk 'NR == 1 && $1 == "Zed" {
+        if ($2 == "Preview") print "preview", $3; else print "stable", $2 }'
+}
+
+# In the box: download Zed's remote server for version $1 into
+# ~/.zed_server under Zed's own name (zed-remote-server-stable-VERSION), so
+# Zed finds it present on first connect. Atomic: a temp name, then one
+# rename, and never over a file Zed already put there. Silent; any failure
+# just leaves Zed to install the server itself. UNVERIFIED (spike Z1): the
+# file name, URL and gzip packaging follow Zed's installer as read, not as
+# observed against this Zed version.
+# shellcheck disable=SC2016
+FETCH='set -eu
+v=$1
+d="$HOME/.zed_server"; f="$d/zed-remote-server-stable-$v"
+[ ! -e "$f" ] || exit 0
+command -v curl >/dev/null 2>&1 || exit 0
+command -v gzip >/dev/null 2>&1 || exit 0
+case $(uname -m) in aarch64|arm64) a=aarch64 ;; x86_64|amd64) a=x86_64 ;; *) exit 0 ;; esac
+mkdir -p "$d"
+t="$d/.min-zed-fetch.$$"
+trap "rm -f \"$t\" \"$t.gz\"" EXIT
+curl -fsSL --max-time 600 -o "$t.gz" "https://github.com/zed-industries/zed/releases/download/v$v/zed-remote-server-linux-$a.gz" || exit 0
+gzip -dc "$t.gz" > "$t" || exit 0
+chmod 755 "$t"
+[ -e "$f" ] || mv -f "$t" "$f"'
+
+# Starts FETCH fully detached in the box and returns at once: setsid +
+# nohup, every stream on /dev/null, so nothing holds `min session exec`'s
+# channel open. $1 FETCH, $2 version.
+# shellcheck disable=SC2016
+LAUNCH='s=; command -v setsid >/dev/null 2>&1 && s=setsid
+$s nohup sh -c "$1" min-zed-fetch "$2" >/dev/null 2>&1 </dev/null &
+exit 0'
+
+# zed_prefetch NAME: open/new only (never prepare or _proxy, whose exec
+# channel a lingering child would hold open). Off unless MIN_ZED_PREFETCH=1.
+zed_prefetch() {
+    [ "$PREFETCH" = 1 ] || return 0
+    zv=$(zed_version)
+    case $zv in
+        "stable "*) zv=${zv#stable } ;;
+        *) dbg "prefetch: no stable Zed version (${zv:-zed --version failed}); Zed installs its own server"; return 0 ;;
+    esac
+    printf '%s\n' "$zv" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { dbg "prefetch: odd Zed version $zv"; return 0; }
+    mn session exec "$1" sh -c "$LAUNCH" "$TOOL" "$FETCH" "$zv" </dev/null >/dev/null 2>&1 \
+        || log "could not start the Zed server pre-fetch in $1; Zed installs it itself"
+}
+
+# ---- connecting -----------------------------------------------------------------
+
+need_ssh_config() {
+    [ -f "$SSH_CONF" ] || die "Zed connects with ssh ${HOST_PREFIX}NAME: run $TOOL ssh-config first (just install does)"
+}
+
+# connect NAME [fresh]: prepare (re-pins the key, refreshes the stanza),
+# refresh Zed's settings, pre-fetch on a fresh session, then hand the
+# project to Zed.
+connect() {
+    prepare "$1"
+    client_on_connect "$1"
+    [ -z "${2:-}" ] || zed_prefetch "$1"
+    ensure_watch
+    have "$ZED" || die "zed CLI not found (Zed: Install CLI, or set ZED_BIN); session $1 is ready: ssh://$HOST_PREFIX$1/workbench"
+    "$ZED" "ssh://$HOST_PREFIX$1/workbench" </dev/null || die "zed could not open ssh://$HOST_PREFIX$1/workbench"
+    printf '%s%s\n' "$HOST_PREFIX" "$1"
+}
+
+# parse_path_name CMD ARGS...: sets $path (absolute) and $name ('' if none).
+parse_path_name() {
+    pc=$1; shift
+    path=. name=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -n|--name) [ $# -ge 2 ] || die "$pc: -n needs a NAME"; name=$2; shift 2 ;;
+            -*) die "$pc: unknown option $1" ;;
+            *) path=$1; shift ;;
+        esac
+    done
+    [ -z "$name" ] || valid_name "$name" || die "session name must be lowercase letters, digits and dashes: $name"
+    [ -d "$path" ] || die "not a directory: $path"
+    path=$(CDPATH='' cd -P -- "$path" && pwd -P)
+}
+
+cmd_open() {
+    parse_path_name open "$@"
+    need_ssh_config
+    fresh=
+    if [ -z "$name" ]; then
+        name=$(own_ls | jq -r --arg p "$path" '[.sessions[] | select(.status == "active" and .project_path == $p
+            and (.name | test("^[a-z0-9][a-z0-9-]*$"))) | .name][0] // empty')
+    elif sess_exists "$name" && [ "$(sess_field "$name" project_path)" != "$path" ]; then
+        die "session $name is for $(sess_field "$name" project_path), not $path"
+    fi
+    if [ -z "$name" ] || ! sess_exists "$name"; then
+        [ -n "$name" ] || name=$(next_name "$path")
+        activate_session "$name" "$path"
+        fresh=1
+    fi
+    connect "$name" "$fresh"
+}
+
+cmd_new() {
+    parse_path_name new "$@"
+    need_ssh_config
+    if [ -n "$name" ]; then ! sess_exists "$name" || die "session $name already exists (min-zed attach $name)"
+    else name=$(next_name "$path"); fi
+    activate_session "$name" "$path"
+    connect "$name" 1
+}
+
+cmd_attach() {
+    name=${1:-}
+    [ -n "$name" ] || name=$(pick_session attach)
+    sess_exists "$name" || die "no session named $name"
+    need_ssh_config
+    connect "$name"
+}
+
+cmd_destroy() {
+    yes=
+    case ${1:-} in -y|--yes) yes=1; shift ;; esac
+    name=${1:-}
+    if [ -z "$name" ]; then
+        here=$(pwd -P)
+        name=$(min_ls | jq -r --arg p "$here" '.sessions[] | select(.project_path == $p) | .name')
+        case $(printf '%s\n' "$name" | grep -c .) in
+            0) die "no session for $here; pass NAME" ;;
+            1) ;;
+            *) die "several sessions for $here: $(printf '%s' "$name" | tr '\n' ' '); pass NAME" ;;
+        esac
+    fi
+    sess_exists "$name" || die "no session named $name"
+    answer=y
+    [ -n "$yes" ] || answer=$(ask_destroy "$name" y/N)
+    rc=0
+    destroy_one "$name" "$answer" || rc=$?
+    exit "$rc"
+}
+
+# gc: offer to destroy each active min-zed session nothing is connected to
+# (no host ssh client of any tool, kernel box_in_use), oldest first. Ages
+# come from orphan/NAME, dated by track_orphans here and in the watch loop.
+cmd_gc() {
+    older=0 dry=
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --older-than) [ $# -ge 2 ] || die "gc: --older-than needs SECONDS"; older=$2; shift 2 ;;
+            --dry-run) dry=1; shift ;;
+            *) die "gc: unknown argument $1" ;;
+        esac
+    done
+    case $older in ''|*[!0-9]*) die "gc: --older-than takes whole seconds" ;; esac
+    now=$(date +%s)
+    ls_json=$(own_ls) || die "min ls failed"
+    track_orphans "$ls_json" "$now"
+    rows=$(printf '%s' "$ls_json" | jq -r '.sessions[] | [.name, (.project_path // "-")] | @tsv' \
+        | while IFS='	' read -r n p; do
+              [ -f "$STATE/orphan/$n" ] || continue
+              since=$(cat "$STATE/orphan/$n")
+              [ $((now - since)) -ge "$older" ] || continue
+              printf '%s\t%s\t%s\n' "$since" "$n" "$p"
+          done | sort -n)
+    rc=0
+    if [ -z "$rows" ]; then
+        echo "no $TOOL sessions running unused"
+        exit 0
+    fi
+    { printf 'NAME\tPROJECT\tUNUSED\n'
+      printf '%s\n' "$rows" | while IFS='	' read -r since n p; do
+          printf '%s\t%s\t%s\n' "$n" "$p" "$(humanise_age $((now - since)))"
+      done; } | table
+    if [ -z "$dry" ]; then
+        for n in $(printf '%s\n' "$rows" | cut -f2); do
+            answer=$(ask_destroy "$n" y/N/q)
+            case $answer in q|Q) break ;; esac
+            destroy_one "$n" "$answer" || rc=$?
+        done
+    fi
+    exit "$rc"
+}
+
+cmd_status() {
+    now=$(date +%s)
+    ls_json=$(min_ls) || die "min ls failed"
+    { printf 'SESSION\tSTATUS\tPROJECT\tMIN-ZED\tIN-USE\tAGENT\tUNUSED\n'
+      printf '%s' "$ls_json" | jq -r '.sessions[] | [.name, .status, (.project_path // "-")] | @tsv' \
+          | while IFS='	' read -r n s p; do
+              own=no; [ -d "$(sess_dir "$n")" ] && own=yes
+              use=no; box_in_use "$n" && use=yes
+              ag=$(cut -d' ' -f1 "$STATE/cache/$n.agent" 2>/dev/null) || ag=
+              a=-; [ -f "$STATE/orphan/$n" ] && a=$(humanise_age $((now - $(cat "$STATE/orphan/$n"))))
+              printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$s" "$p" "$own" "$use" "${ag:--}" "$a"
+          done; } | table
+}
+
+cmd_doctor() {
+    FAILS=0
+    cfgdir=${XDG_CONFIG_HOME:-$HOME/.config}
+
+    MIN=$(resolve_min 2>/dev/null) || MIN=
+    if [ -n "$MIN" ]; then
+        v=$(mn version </dev/null 2>/dev/null | awk '$1 == "Client:" { print $3; exit }')
+        case $v in
+            0.6.*) row ok min "$MIN $v" ;;
+            *) row warn min "$MIN version ${v:-unknown}; tested with 0.6.0" "upgrade min, or expect rough edges" ;;
+        esac
+    else
+        row FAIL min "min not found" "install Minimal, or set MIN_BIN to the min binary"
+    fi
+
+    if have "$ZED"; then
+        zv=$(zed_version)
+        case $zv in
+            "stable $ZED_TESTED") row ok zed "$(command -v "$ZED") ${zv#stable }" ;;
+            *) row warn zed "$(command -v "$ZED") ${zv:-unknown version}; tested with $ZED_TESTED" "update Zed, or expect rough edges" ;;
+        esac
+    else
+        row FAIL zed "zed CLI not found" "Zed > Install CLI (or brew install --cask zed), or set ZED_BIN"
+    fi
+
+    missing=
+    for t in jq python3; do have "$t" || missing="$missing $t"; done
+    if [ -z "$missing" ]; then row ok tools "jq, python3"
+    else row FAIL tools "missing:$missing" "install$missing (e.g. brew install$missing)"; fi
+
+    l="$cfgdir/minimal/loadouts/$LOADOUT.toml"
+    if [ ! -e "$l" ]; then
+        row FAIL loadout "$l missing" "just loadout"
+    elif [ -n "$MIN" ] && ! mn loadout list --config-dir "$cfgdir" </dev/null 2>/dev/null \
+            | awk -v l="$LOADOUT" '$1 == l || ($1 == "*" && $2 == l) { f = 1 } END { exit !f }'; then
+        row FAIL loadout "min loadout list does not show $LOADOUT" "check $l parses: min loadout list"
+    else
+        row ok loadout "$LOADOUT installed (sessions are activated with --loadout $LOADOUT)"
+    fi
+
+    if mkdir -p "$STATE" 2>/dev/null && [ -w "$STATE" ]; then row ok "state dir" "$STATE"
+    else row FAIL "state dir" "$STATE not writable" "fix permissions, or set ${ENV_PREFIX}_STATE_DIR"; fi
+
+    if have ssh; then row ok ssh "$(command -v ssh)"
+    else row FAIL ssh "ssh not found" "install OpenSSH"; fi
+
+    inc=; grep -qxF -- "$SSH_MARK2" "$SSH_MAIN" 2>/dev/null && inc=1
+    if [ -n "$inc" ] && [ -f "$SSH_CONF" ]; then
+        row ok ssh-config "$(ssh_stanza_count) stanza(s) in $SSH_CONF"
+        first=$(sed -n "s/^Host $HOST_RE\\([^*]*\\)\$/\\1/p" "$SSH_CONF" | head -1)
+        pc=
+        if [ -z "$first" ]; then :
+        elif out=$(ssh -G -F "$SSH_MAIN" "$HOST_PREFIX$first" 2>&1); then
+            pc=$(printf '%s\n' "$out" | awk '$1 == "proxycommand"')
+        else
+            row warn ssh-config "ssh -G -F $SSH_MAIN $HOST_PREFIX$first fails: $(printf '%s\n' "$out" | tail -1)" "fix the quoted line, or $TOOL ssh-config --remove"
+        fi
+        case $pc in
+            ''|*_proxy*) ;;
+            *) row warn ssh-config "ssh -G does not route $HOST_PREFIX$first via $TOOL; an earlier Host/Match block may shadow it" "move the $TOOL Include above every Host/Match in $SSH_MAIN" ;;
+        esac
+    elif [ -z "$inc" ] && [ ! -e "$SSH_CONF" ]; then
+        row FAIL ssh-config "not installed; Zed cannot reach a session" "$TOOL ssh-config (just install does)"
+    elif [ -n "$inc" ]; then
+        row FAIL ssh-config "$SSH_MAIN includes $SSH_CONF, which is missing" "$TOOL ssh-config"
+    else
+        row FAIL ssh-config "$SSH_CONF exists but $SSH_MAIN does not include it" "$TOOL ssh-config"
+    fi
+
+    if [ ! -f "$ZED_CONFIGURED" ]; then
+        row ok zed-config "settings sync off (optional): $TOOL zed-config"
+    elif have python3; then
+        names=
+        [ -z "$MIN" ] || names=$(zed_names 2>/dev/null) || names=
+        # shellcheck disable=SC2086
+        out=$(python3 "$(src_dir)/min-zed-config" --doctor --settings "$ZED_SETTINGS" $names 2>&1) \
+            || out="FAIL	min-zed-config --doctor failed: $(printf '%s' "$out" | tail -1)"
+        while IFS='	' read -r lvl msg fix; do
+            if [ -n "$lvl" ]; then row "$lvl" zed-config "$msg" "$fix"; fi
+        done <<EOT
+$out
+EOT
+    fi
+
+    if watch_running; then row ok watch "running (pid $(watch_pid))"
+    else row warn watch "not running; no agent-state notifications" "$TOOL watch --ensure (open and attach start it)"; fi
+
+    if [ "$PREFETCH" = 1 ]; then row warn prefetch "on (MIN_ZED_PREFETCH=1); unverified, spike Z1" "unset MIN_ZED_PREFETCH if Zed reinstalls its server anyway"
+    else row ok prefetch "off (Zed installs its own server; MIN_ZED_PREFETCH=1 to try the unverified pre-fetch)"; fi
+
+    [ "$FAILS" -eq 0 ]
+}
+
+cmd_completions() {
+    case ${1:-} in
+        zsh) cat <<'ZSH'
+#compdef min-zed
+_min_zed() {
+    local -a cmds sess
+    cmds=(open new attach destroy gc status doctor watch ssh ssh-config zed-config completions)
+    if (( CURRENT == 2 )); then
+        compadd -a cmds
+        return
+    fi
+    case $words[2] in
+        open|new) _arguments '-n[session name]:name:' '1:path:_directories' ;;
+        attach) sess=(${(f)"$(min-zed _sessions 2>/dev/null)"}); compadd -a sess ;;
+        destroy)
+            sess=(${(f)"$(min-zed _sessions 2>/dev/null)"})
+            compadd -- -y
+            compadd -a sess ;;
+        ssh)
+            (( ${words[(I)--]} )) && return
+            if (( CURRENT == 3 )); then
+                sess=(${(f)"$(min-zed _sessions 2>/dev/null)"}); compadd -a sess
+            else
+                compadd -- --
+            fi ;;
+        watch) compadd -- --ensure --stop ;;
+        ssh-config|zed-config) compadd -- --remove --print ;;
+        gc) [[ $words[CURRENT-1] == --older-than ]] || compadd -- --older-than --dry-run ;;
+        completions) compadd zsh bash ;;
+    esac
+}
+compdef _min_zed min-zed
+ZSH
+        ;;
+        bash) cat <<'BASH'
+_min_zed() {
+    local cur=${COMP_WORDS[COMP_CWORD]} prev=${COMP_WORDS[COMP_CWORD-1]} sub=${COMP_WORDS[1]:-} w
+    local IFS=$'\n'
+    COMPREPLY=()
+    if [ "$COMP_CWORD" -eq 1 ]; then
+        COMPREPLY=($(compgen -W "open new attach destroy gc status doctor watch ssh ssh-config zed-config completions" -- "$cur"))
+        return
+    fi
+    case $sub in
+        open|new)
+            if [ "$prev" = -n ]; then return; fi
+            COMPREPLY=($(compgen -d -- "$cur") $(compgen -W "-n" -- "$cur")) ;;
+        attach) COMPREPLY=($(compgen -W "$(min-zed _sessions 2>/dev/null)" -- "$cur")) ;;
+        destroy) COMPREPLY=($(compgen -W "-y $(min-zed _sessions 2>/dev/null)" -- "$cur")) ;;
+        ssh)
+            for w in "${COMP_WORDS[@]:2:COMP_CWORD-2}"; do [ "$w" = -- ] && return; done
+            if [ "$COMP_CWORD" -eq 2 ]; then
+                COMPREPLY=($(compgen -W "$(min-zed _sessions 2>/dev/null)" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--" -- "$cur"))
+            fi ;;
+        watch) COMPREPLY=($(compgen -W "--ensure --stop" -- "$cur")) ;;
+        ssh-config|zed-config) COMPREPLY=($(compgen -W "--remove --print" -- "$cur")) ;;
+        gc)
+            if [ "$prev" = --older-than ]; then return; fi
+            COMPREPLY=($(compgen -W "--older-than --dry-run" -- "$cur")) ;;
+        completions) COMPREPLY=($(compgen -W "zsh bash" -- "$cur")) ;;
+    esac
+}
+complete -F _min_zed min-zed
+BASH
+        ;;
+        *) die "completions: expected zsh or bash" ;;
+    esac
+}
+
+# ---- watch: agent-state notifications (UNVERIFIED end to end: spike E1) ---------
+
+watch_pid() { cat "$STATE/watch.pid" 2>/dev/null || true; }
+watch_running() {
+    wp=$(watch_pid)
+    [ -n "$wp" ] && kill -0 "$wp" 2>/dev/null && ps -o command= -p "$wp" 2>/dev/null | grep -q "$TOOL watch"
+}
+ensure_watch() {
+    watch_running && return 0
+    [ "${MIN_ZED_NO_WATCH:-}" = 1 ] && return 0
+    mkdir -p "$STATE"
+    nohup "$SELF" watch >>"$STATE/watch.log" 2>&1 </dev/null &
+    dbg "started watch (pid $!)"
+}
+
+# notify TITLE SUBTITLE BODY: a macOS notification. Values go in as
+# AppleScript argv, never spliced into the script.
+notify() {
+    "$OSASCRIPT" -e 'on run argv' \
+        -e 'display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)' \
+        -e 'end run' "$1" "$2" "$3" </dev/null >/dev/null 2>&1 || log "osascript notification failed"
+}
+
+# poll_state NAME NOW: read the box's agent-state file ("state epoch
+# message", written by the loadout's Claude hook) and notify when it changed
+# to needs-input or finished. Called only for boxes box_in_use says have a
+# live ssh client, so the read never starts a stopped box. The box is
+# untrusted: state must be a known word, epoch digits, message printable.
+poll_state() {
+    ph=$(cat "$(sess_dir "$1")/home" 2>/dev/null) || ph=/home
+    fact_ok "$PATH_ERE" "$ph" || ph=/home
+    line=$(mn session exec "$1" cat "$ph/$STATE_FILE" </dev/null 2>/dev/null | head -1) || line=
+    [ -n "$line" ] || return 0
+    st=${line%% *}; rest=${line#* }; ep=${rest%% *}; msg=
+    [ "$rest" = "$ep" ] || msg=${rest#* }
+    case $st in started|working|needs-input|finished|idle|clear) ;; *) dbg "$1: odd agent state"; return 0 ;; esac
+    case $ep in ''|*[!0-9]*) return 0 ;; esac
+    key="$st $ep"
+    cf=$STATE/cache/$1.agent
+    prev=$(cat "$cf" 2>/dev/null) || prev=
+    [ "$prev" != "$key" ] || return 0
+    mkdir -p "$STATE/cache"; printf '%s' "$key" > "$cf"
+    # First sight of a box: only a fresh state is news.
+    [ -n "$prev" ] || [ $(($2 - ep)) -le $((INTERVAL * 2 + 10)) ] || return 0
+    msg=$(printf '%s' "$msg" | tr -d '\000-\037\177' | cut -c1-200)
+    case $st in
+        needs-input) notify "$TOOL" "$1: needs input" "${msg:-Claude is waiting for you}" ;;
+        finished) notify "$TOOL" "$1: finished" "Claude finished${msg:+: $msg}" ;;
+    esac
+}
+
+tick() {
+    now=$(date +%s)
+    ls_json=$(own_ls) || { log "min ls failed; skipping this tick"; return 0; }
+    track_orphans "$ls_json" "$now"
+    for n in $(printf '%s' "$ls_json" | jq -r '.sessions[] | select(.status == "active") | .name'); do
+        valid_name "$n" || continue
+        box_in_use "$n" || continue
+        poll_state "$n" "$now"
+    done
+}
+
+cmd_watch() {
+    case ${1:-} in
+        --stop)
+            if watch_running; then kill "$(watch_pid)" && echo "stopped $TOOL watch (pid $(watch_pid))"
+            else echo "$TOOL watch is not running"; fi
+            return 0 ;;
+        --ensure)
+            if watch_running; then echo "watch already running (pid $(watch_pid))"; return 0; fi
+            [ "${MIN_ZED_NO_WATCH:-}" != 1 ] || { echo "watch disabled (MIN_ZED_NO_WATCH=1)"; return 0; }
+            ensure_watch; echo "watch started"; return 0 ;;
+        '') ;;
+        *) die "watch: unknown option $1" ;;
+    esac
+    ! watch_running || die "watch already running (pid $(watch_pid))"
+    mkdir -p "$STATE/cache"
+    printf '%s' "$$" > "$STATE/watch.pid"
+    trap 'rm -f "$STATE/watch.pid"; exit 0' INT TERM
+    log "watch: polling connected boxes every ${INTERVAL}s"
+    while :; do
+        tick || log "tick failed"
+        sleep "$INTERVAL"
+    done
+}
+
+# ---- main ----------------------------------------------------------------------
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+cmd=$1; shift
+case $cmd in
+    -h|--help|help) usage; exit 0 ;;
+    doctor) cmd_doctor "$@"; exit $? ;;
+    completions) cmd_completions "$@"; exit 0 ;;
+    ssh-config) MIN=$(resolve_min 2>/dev/null) || MIN=; cmd_ssh_config "$@"; exit 0 ;;
+    zed-config) MIN=$(resolve_min 2>/dev/null) || MIN=; cmd_zed_config "$@"; exit 0 ;;
+    _proxy) [ "${1:-}" != --missing ] || cmd_proxy "$@" ;;   # --missing always dies; needs no min
+esac
+MIN=$(resolve_min)
+mkdir -p "$STATE"
+case $cmd in
+    open) cmd_open "$@" ;;
+    new) cmd_new "$@" ;;
+    attach) cmd_attach "$@" ;;
+    destroy) cmd_destroy "$@" ;;
+    gc) cmd_gc "$@" ;;
+    ssh) cmd_ssh "$@" ;;
+    status) cmd_status "$@" ;;
+    watch) cmd_watch "$@" ;;
+    _sessions) min_ls | jq -r '.sessions[].name' ;;
+    _proxy) cmd_proxy "$@" ;;
+    *) usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stub for herdr: logs argv; `--machine DEST agent list` serves
+# $FIXTURES/herdr.agents.DEST.json (no agents by default).
+echo "herdr $*" >> "$STUB_LOG"
+if [ "${1:-}" = --machine ] && [ "${3:-} ${4:-}" = "agent list" ]; then
+    cat "$FIXTURES/herdr.agents.$2.json" 2>/dev/null || echo '{"result":{"agents":[],"type":"agent_list"}}'
+fi
+exit 0

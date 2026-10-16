@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stub for find, linked only by the stale-lock stress case: the real find,
+# then a 10-90ms pause varying by pid, widening the gap between a waiter's
+# stale-lock check and what it does next.
+/usr/bin/find "$@"; r=$?
+sleep "0.0$(($$ % 9 + 1))"
+exit "$r"

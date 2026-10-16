@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -5 112 34" width="448" height="136" role="img" aria-label="min-zed">
+  <title>min-zed</title>
+  <!-- Minimal glyph, then "zed" set in a bold monospace (not outlined: AstroMono is not in this repo), over a rule. -->
+  <path fill="#fafafa" d="M10.2734 0H18.1767L29.2412 16V24H21.338L10.2734 8V0ZM3.16132 24L0 19.4285V11.4286H7.90326L11.0645 16V24H3.16132ZM28.4531 0H36.3564L47.4208 16V24H39.5176L28.4531 8V0Z"/>
+  <text x="54" y="22" fill="#fafafa" font-family="'AstroMono', ui-monospace, SFMono-Regular, Menlo, monospace" font-weight="700" font-size="25" letter-spacing="0.5">zed</text>
+  <rect x="54" y="26.5" width="55" height="2.6" rx="1.3" fill="#4d8dff"/>
+</svg>

@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Keep min-zed's ssh_connections entries in Zed's settings.json in step with live sessions.
+
+Usage: min-zed-config [--settings PATH] [--backup-dir DIR] [--dry-run|--remove|--doctor] [NAME...]
+
+The NAMEs are the live min-zed sessions. Afterwards the settings hold exactly
+one `ssh_connections` entry per NAME whose host is `min-zed.NAME`; entries
+whose host does not start with `min-zed.` are never touched, and an entry of
+ours that already exists is kept as written (so a hand-added option such as
+`upload_binary_over_ssh` survives).
+
+settings.json is JSONC (comments, trailing commas). Like minx-config, this
+edits text, not a re-serialised object, so the user's comments and layout
+stay: it parses leniently to learn the structure, then rewrites only the
+`ssh_connections` array (or splices a new key in after the opening brace, or
+removes the key when it held only our entries). The file is written through
+(a dotfiles symlink stays a symlink), after a dated backup, and never when the
+effective settings would not change. `--remove` drops every entry of ours.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+
+PREFIX = "min-zed."
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+KEY = "ssh_connections"
+KEEP_BACKUPS = 20
+
+
+def strip_jsonc(text):
+    """Return text with // and /* */ comments and trailing commas blanked.
+
+    Every other byte keeps its offset (comments become spaces, newlines stay),
+    so positions found in the result are valid in the original text.
+    """
+    out = []
+    i, n = 0, len(text)
+    last_comma = -1
+
+    def blank(s):
+        return "".join(c if c in "\r\n" else " " for c in s)
+
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            out.append(text[i : j + 1])
+            i = j + 1
+            last_comma = -1
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(blank(text[i:j]))
+            i = j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append(blank(text[i:j]))
+            i = j
+            continue
+        if c == ",":
+            last_comma = len(out)
+        elif c in "}]" and last_comma >= 0:
+            out[last_comma] = " "
+            last_comma = -1
+        elif not c.isspace():
+            last_comma = -1
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def load_jsonc(text):
+    s = strip_jsonc(text)
+    return (json.loads(s) if s.strip() else {}), s
+
+
+def skip_value(s, i):
+    """Index just past the JSON value starting at s[i] (s is stripped text)."""
+    c = s[i]
+    if c == '"':
+        j = i + 1
+        while s[j] != '"':
+            j += 2 if s[j] == "\\" else 1
+        return j + 1
+    if c in "{[":
+        depth, j = 0, i
+        while True:
+            ch = s[j]
+            if ch == '"':
+                j = skip_value(s, j)
+                continue
+            if ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+    j = i
+    while j < len(s) and s[j] not in ",}] \t\r\n":
+        j += 1
+    return j
+
+
+def ws(s, i):
+    while i < len(s) and s[i].isspace():
+        i += 1
+    return i
+
+
+def top_members(s):
+    """[(key, key_start, value_start, value_end)] of the top-level object, and its brace index."""
+    brace = ws(s, 0)
+    if brace >= len(s) or s[brace] != "{":
+        raise ValueError("top level is not an object")
+    members, i = [], ws(s, brace + 1)
+    while i < len(s) and s[i] != "}":
+        if s[i] == ",":
+            i = ws(s, i + 1)
+            continue
+        kend = skip_value(s, i)
+        key = json.loads(s[i:kend])
+        colon = ws(s, kend)
+        vstart = ws(s, colon + 1)
+        vend = skip_value(s, vstart)
+        members.append((key, i, vstart, vend))
+        i = ws(s, vend)
+    return members, brace
+
+
+def elements(s, start, end):
+    """[(el_start, el_end)] of the array s[start:end]."""
+    out, i = [], ws(s, start + 1)
+    while i < end - 1:
+        if s[i] == ",":
+            i = ws(s, i + 1)
+            continue
+        j = skip_value(s, i)
+        out.append((i, j))
+        i = ws(s, j)
+    return out
+
+
+def ours(entry):
+    return isinstance(entry, dict) and isinstance(entry.get("host"), str) and entry["host"].startswith(PREFIX)
+
+
+def render(name):
+    return json.dumps({"host": PREFIX + name, "nickname": name, "projects": [{"paths": ["/workbench"]}]})
+
+
+def line_indent(text, pos):
+    start = text.rfind("\n", 0, pos) + 1
+    m = re.match(r"[ \t]*", text[start:pos])
+    return m.group(0) if m else ""
+
+
+def plan(text, names):
+    """The new settings text for exactly these names (ours), or the text unchanged."""
+    if not text.strip():
+        text = "{\n}\n"
+    s = strip_jsonc(text)
+    members, brace = top_members(s)
+    found = [m for m in members if m[0] == KEY]
+    want = sorted(set(names))
+    if not found:
+        if not want:
+            return text
+        ind = "  "
+        body = ",\n".join(f"{ind}  {render(n)}" for n in want)
+        sep = "," if members else ""
+        return f"{text[:brace + 1]}\n{ind}\"{KEY}\": [\n{body}\n{ind}]{sep}{text[brace + 1:]}"
+    key, kstart, vstart, vend = found[-1]
+    if s[vstart] != "[":
+        raise ValueError(f"{KEY} is not a list; fix it by hand")
+    foreign, mine = [], {}
+    for a, b in elements(s, vstart, vend):
+        val = json.loads(s[a:b])
+        if ours(val):
+            mine.setdefault(val["host"][len(PREFIX):], text[a:b])
+        else:
+            foreign.append(text[a:b])
+    items = foreign + [mine.get(n, render(n)) for n in want]
+    if not items and mine:
+        # Only ours were there: drop the key, with its comma and its line.
+        a, b = kstart, vend
+        nb = ws(s, b)
+        if nb < len(s) and s[nb] == ",":
+            b = nb + 1
+        else:
+            pa = a - 1
+            while pa > brace and s[pa].isspace():
+                pa -= 1
+            if s[pa] == ",":
+                a = pa
+        while a > 0 and text[a - 1] in " \t":
+            a -= 1
+        if a > 0 and text[a - 1] == "\n" and a - 1 > brace:
+            a -= 1
+        return text[:a] + text[b:]
+    ind = line_indent(text, kstart)
+    if not items:
+        new = "[]"
+    else:
+        new = "[\n" + ",\n".join(f"{ind}  {it}" for it in items) + f"\n{ind}]"
+    return text[:vstart] + new + text[vend:]
+
+
+def our_hosts(cfg):
+    conns = cfg.get(KEY) if isinstance(cfg, dict) else None
+    return sorted(e["host"][len(PREFIX):] for e in conns if ours(e)) if isinstance(conns, list) else []
+
+
+def backup(path, bdir):
+    os.makedirs(bdir, mode=0o700, exist_ok=True)
+    base = os.path.join(bdir, "zed-settings.json." + time.strftime("%Y%m%dT%H%M%S"))
+    dst, i = base, 1
+    while os.path.exists(dst):
+        dst, i = f"{base}.{i}", i + 1
+    with open(path, "rb") as f, open(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as g:
+        g.write(f.read())
+    old = sorted(p for p in os.listdir(bdir) if p.startswith("zed-settings.json."))
+    for p in old[:-KEEP_BACKUPS]:
+        os.unlink(os.path.join(bdir, p))
+    return dst
+
+
+def doctor(path, names):
+    def row(level, msg, fix=""):
+        print("\t".join([level, msg] + ([fix] if fix else [])))
+
+    if not os.path.exists(path):
+        return row("warn", f"{path} missing; no saved connections", "min-zed zed-config")
+    try:
+        with open(path, encoding="utf-8") as f:
+            cfg, _ = load_jsonc(f.read())
+    except ValueError as e:
+        return row("FAIL", f"{path} is not valid JSONC ({e})", "fix the syntax; Zed ignores a broken settings file")
+    have = our_hosts(cfg)
+    want = sorted(set(names))
+    if have == want:
+        row("ok", f"{len(have)} min-zed connection(s) in {path}")
+    else:
+        row("warn", f"{path} lists {', '.join(have) or 'none'}; live sessions: {', '.join(want) or 'none'}",
+            "min-zed zed-config")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("names", nargs="*", help="live session names")
+    ap.add_argument("--settings", default=os.environ.get("MIN_ZED_SETTINGS") or os.path.expanduser("~/.config/zed/settings.json"))
+    ap.add_argument("--backup-dir", default=None, help="where dated backups go (default: next to the settings)")
+    ap.add_argument("--remove", action="store_true", help="drop every min-zed.* entry")
+    ap.add_argument("--dry-run", action="store_true", help="print the resulting file; write nothing")
+    ap.add_argument("--doctor", action="store_true", help="report for `min-zed doctor`; write nothing")
+    ap.add_argument("--quiet", action="store_true", help="say nothing when nothing changes")
+    a = ap.parse_args()
+    bad = [n for n in a.names if not NAME_RE.match(n)]
+    if bad:
+        sys.exit(f"min-zed-config: not a session name: {bad[0]!r}")
+    if a.doctor:
+        return doctor(a.settings, a.names)
+
+    path = a.settings
+    exists = os.path.exists(path)
+    text = ""
+    if exists:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    try:
+        current, _ = load_jsonc(text)
+        target = plan(text, [] if a.remove else a.names)
+        result, _ = load_jsonc(target)
+    except (ValueError, IndexError) as e:
+        sys.exit(f"min-zed-config: {path}: cannot edit ({e}); edit ssh_connections by hand")
+
+    if a.dry_run:
+        sys.stdout.write(target)
+        return
+    if result == current:
+        if not a.quiet:
+            print(f"{path}: min-zed connections already up to date")
+        return
+
+    bdir = a.backup_dir or os.path.dirname(path) or "."
+    saved = backup(path, bdir) if exists else None
+    if not exists:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # Write through: a symlinked settings.json stays a symlink, mode kept.
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(target)
+    print(f"min-zed-config: {path}: min-zed connections now {', '.join(our_hosts(result)) or 'none'}"
+          + (f" (previous version: {saved})" if saved else ""), file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stub for osascript: logs only the argv items after the -e scripts
+# (title, subtitle, body), as "osascript | TITLE | SUBTITLE | BODY".
+while [ "${1:-}" = -e ]; do shift 2; done
+line="osascript"
+for a in "$@"; do line="$line | $a"; done
+echo "$line" >> "$STUB_LOG"
+exit 0

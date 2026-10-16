@@ -1,0 +1,33 @@
+name: Bug report
+description: min-zed is broken or behaving unexpectedly
+labels: ["bug"]
+body:
+  - type: textarea
+    id: doctor
+    attributes:
+      label: min-zed doctor
+      description: Output of `min-zed doctor`, run on the host.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: zed-version
+    attributes:
+      label: Zed version
+      placeholder: zed --version
+    validations:
+      required: true
+  - type: input
+    id: min-version
+    attributes:
+      label: min version
+      placeholder: min version
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: >-
+        What you ran, what Zed showed, and what you expected. `~/.local/state/min-zed/proxy.log`
+        (one line per connection) and `watch.log` often help; `min-zed ssh NAME -- -v true` shows the transport.
