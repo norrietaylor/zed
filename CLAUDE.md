@@ -17,7 +17,7 @@ the min-<client> repos (plan of record:
 | `bin/min-zed-config` | python3: keeps `ssh_connections` entries whose host starts `min-zed.` in Zed's `settings.json` equal to the live sessions (JSONC text edit, backup, no-op when unchanged, `--remove`, `--doctor`, `--dry-run`) |
 | `loadouts/zed.toml` | Minimal loadout `zed`: `openssh curl jq rsync xxhash`; sshd env + `min:workbench` rc line; Claude hook `~/.claude/min-zed-hook.sh` writing `/home/.min-zed/agent-state` |
 | `justfile` | `check install loadout uninstall ssh-config zed-config kernel-sha` |
-| `tests/run.sh`, `tests/stubs/`, `tests/kernel.sha` | plain-sh tests over stub `min zed ssh ssh-keygen ps osascript herdr curl` (+ `find`/`mv` for PREP races); a second pass with a long `HOST_PREFIX` |
+| `tests/run.sh`, `tests/stubs/`, `tests/kernel.sha`, `tests/kernel-sha.sh` | plain-sh tests over stub `min zed ssh ssh-keygen ps osascript herdr curl` (+ `find`/`mv` for PREP races); a second pass with a long `HOST_PREFIX`; two-tool ssh-config coexistence in all four install/remove orders |
 | `README.md`, `docs/` | `zed.md` (guide), `commands.md`, `configuration.md`, `how-it-works.md`, `security.md`, `troubleshooting.md`, `spike.md` (Z1, E1, K1), `manual-test-plan.md` |
 | `docs/public/` | `min-zed-mark-{dark,light}.svg` (Minimal glyph + "zed", text not outlined), `built-with-minimal.svg` |
 | `CHANGELOG.md`, `LICENSE`, `.github/ISSUE_TEMPLATE/` | Keep a Changelog, Apache-2.0, bug template asking for `doctor` output |
@@ -69,18 +69,27 @@ the min-<client> repos (plan of record:
   `~/.ssh/min-zed/`; `~/.ssh/environment` shared; one `/workbench` rc line
   (`minx:workbench` or `min:workbench` counts); the loadout's jq merge removes
   only `min-zed-hook` entries.
-- Install never edits `default_loadouts`; sessions are activated with
-  `--loadout zed`. `just uninstall` removes only its own symlinks and never
-  restores a `.bak`.
+- Install never edits `config.toml`; `activate_session` passes the user's
+  `default_loadouts`, then `--loadout zed` last. `just uninstall` removes only
+  its own symlinks and never restores a `.bak`.
+- `~/.ssh` coexistence: each tool has its own Include pair and `TOOL.conf`;
+  what the first install created is in the shared
+  `${XDG_STATE_HOME:-~/.local/state}/min-clients/ssh-config-created`, deleted
+  (with what it lists, if empty) by whichever tool removes the last Include.
+- Tests reach tools only through stubs under `$T/bin` or nonexistent
+  absolute paths (`case_tests_use_absolute_tool_paths` checks): a bare name
+  resolves through the kernel's `/opt/homebrew/bin` PATH fallback to the real
+  `zed`.
 
 ## Kernel
 
-Do not edit the kernel block here. Changes go into the cmux repo's
-`bin/min-cmux` first, then are copied byte for byte into every repo, then
-`just kernel-sha`. The block in this repo is a **provisional port** of minx
-made while the cmux kernel was being produced; replace it with the frozen
-cmux block (and re-pin) before release. `tests/run.sh` checks the pin and
-that the block mentions neither Zed nor osascript.
+Do not edit the kernel block here: it is the frozen cmux block
+(`~/code/min-clients/cmux/bin/min-cmux` lines 25–698, "As built" in
+`~/code/min-clients/KERNEL.md`), byte for byte. Changes go into the cmux
+repo first, then are copied into every repo, then `just kernel-sha`.
+`tests/run.sh` checks the pin and that the block mentions neither Zed nor
+osascript. The kernel defines no hook defaults: `hook NAME` calls a
+`client_*` function only when the client layer defines it.
 
 ## External facts that bite
 
@@ -97,7 +106,8 @@ that the block mentions neither Zed nor osascript.
   read on every `prepare`.
 - sshd scrubs the environment: `PermitUserEnvironment=yes` +
   `~/.ssh/environment`, with `PROMPT_COMMAND`/`MINIMAL_MOTD` filtered out.
-- `min session activate --loadout X` makes min ignore `default_loadouts`.
+- `min session activate --loadout X` makes min ignore `default_loadouts`
+  (hence `activate_session` passes them on).
 - Zed 1.22 (2026-10-02, via minx): `zed ssh://HOST/PATH` reads
   `~/.ssh/config`; Zed runs its own ControlMaster and downloads
   `zed-remote-server-linux-<arch>` inside the box with curl into

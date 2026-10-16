@@ -33,6 +33,10 @@ First release, split from [minx](https://github.com/noric-labs/minx).
   stays shared at `~/.ssh/minx/host_ed25519`.
 - Use detection reads any tool's `session exec NAME … sshd` process, not
   only `ssh min.NAME` command lines.
-- Install leaves `default_loadouts` alone.
+- Install leaves `config.toml` alone; sessions get the user's
+  `default_loadouts` plus `--loadout zed` last.
+- What ssh-config created under `~/.ssh` is recorded once for every
+  min-<client> tool (`~/.local/state/min-clients/ssh-config-created`); the
+  tool removing the last Include deletes it.
 
 [0.1.0]: https://github.com/norrietaylor/zed/releases/tag/v0.1.0

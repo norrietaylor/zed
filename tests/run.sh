@@ -35,6 +35,7 @@ setup() {
     HERDR_BIN=$T/bin/herdr
     MIN_ZED_STATE_DIR=$STATE MIN_ZED_NO_WATCH=1 MIN_ZED_SETTINGS=$T/zed/settings.json
     ZS=$MIN_ZED_SETTINGS
+    CREATED=$HOME/.local/state/min-clients/ssh-config-created   # shared by every min-<client> tool
     unset MIN_ZED_PREFETCH MIN_ZED_DEBUG XDG_CONFIG_HOME XDG_STATE_HOME
     export HOME PATH STUB_LOG FIXTURES MIN_BIN SSH_KEYGEN_BIN ZED_BIN OSASCRIPT_BIN HERDR_BIN \
         MIN_ZED_STATE_DIR MIN_ZED_NO_WATCH MIN_ZED_SETTINGS
@@ -596,11 +597,12 @@ case_sshconfig_remove_deletes_what_it_created() {
     rm -rf "$STATE"
     run ssh-config
     assert_rc 0
-    assert_file "$STATE/ssh-config-created" "dir
+    assert_file "$CREATED" "dir
 config"
     run ssh-config --remove
     assert_rc 0
     assert_no_file "$HOME/.ssh"
+    assert_no_file "$CREATED"
     mkdir -p "$HOME/.ssh"; : > "$HOME/.ssh/config"
     run ssh-config
     run ssh-config --remove
@@ -1182,13 +1184,14 @@ case_inuse_any_tools_sshd_counts() {
     cat > "$FIXTURES/ps.txt" <<EOF
   100     1 ssh -o ControlMaster=yes min-cmux.alpha
   101   100 /opt/homebrew/bin/min session exec alpha /usr/sbin/sshd -i -e -f /dev/null
-  200     1 /bin/zsh -c min session exec beta /usr/sbin/sshd
-  201     1 /bin/zsh -c echo session exec beta sshd
+  200     1 /bin/zsh -c ssh min-zed.beta
+  201     1 /usr/bin/ssh -o ConnectTimeout=5 build.example tail -f min-zed.beta
   300     1 /opt/homebrew/bin/min session exec gamma sh -c PREP min-zed key
 EOF
     run gc --dry-run
     assert_rc 0
     ! grep -q '^alpha ' "$T/out" || fail "alpha is in use (another tool's sshd)"
+    grep -q '^beta ' "$T/out" || fail "a shell or ssh that only mentions beta is not use"
     grep -q '^gamma ' "$T/out" || fail "gamma is not in use"
     ! grep -q cmuxbox "$T/out" || fail "gc lists another tool's session"
     assert_log_not_contains "session exec"     # deciding use never contacts a box
@@ -1254,10 +1257,11 @@ case_gc_in_use_session_loses_its_age() {
     age beta 200000
     printf '  1 0 ssh min-zed.beta\n  2 1 /x/min session exec beta /usr/sbin/sshd -i\n' > "$FIXTURES/ps.txt"
     run gc --dry-run
-    assert_no_file "$STATE/orphan/beta"
+    ! grep -q '^beta ' "$T/out" || fail "beta is in use"
+    [ $(($(date +%s) - $(cat "$STATE/orphan/beta"))) -lt 60 ] || fail "beta's age should restart while in use"
     : > "$FIXTURES/ps.txt"
     run gc --dry-run
-    [ $(($(date +%s) - $(cat "$STATE/orphan/beta"))) -lt 60 ] || fail "beta's age should count from its last use"
+    grep -q '^beta .* 0m$' "$T/out" || fail "beta's age should count from its last use: $(grep beta "$T/out")"
 }
 
 case_status_table() {
@@ -1449,12 +1453,92 @@ case_completions_parse() {
 }
 
 case_kernel_sha_pinned() {
-    have=$(sed -n '/^# --- kernel begin/,/^# --- kernel end ---$/p' "$BIN" | shasum -a 256 | cut -d' ' -f1)
-    [ "$(sed -n '/^# --- kernel begin/p' "$BIN" | wc -l | tr -d ' ')" = 1 ] || fail "kernel begin marker missing or repeated"
-    [ "$(sed -n '/^# --- kernel end ---$/p' "$BIN" | wc -l | tr -d ' ')" = 1 ] || fail "kernel end marker missing or repeated"
+    have=$(sh "$ROOT/tests/kernel-sha.sh" "$BIN") || { fail "kernel-sha.sh failed"; return 0; }
     [ "$have" = "$(cat "$ROOT/tests/kernel.sha")" ] || fail "kernel block hash $have differs from tests/kernel.sha (just kernel-sha after syncing from cmux)"
     # the kernel is client-free
     ! sed -n '/^# --- kernel begin/,/^# --- kernel end ---$/p' "$BIN" | grep -iqE '(^|[^a-z])zed([^a-z]|$)|osascript' || fail "client code inside the kernel block"
+}
+
+# Two min-<client> tools install and remove ssh-config in every order:
+# ~/.ssh/config ends byte for byte as it was, or is gone (with ~/.ssh) when
+# neither found one; the first removal leaves the other tool working.
+make_tool_b() {
+    mkdir -p "$T/tool-b"
+    # shellcheck disable=SC2016  # $MIN_ZZ_STATE_DIR is for the copy
+    sed -e 's/^TOOL=min-zed$/TOOL=min-zz/' -e 's/^HOST_PREFIX=.*/HOST_PREFIX=min-zz./' \
+        -e 's/^ENV_PREFIX=MIN_ZED$/ENV_PREFIX=MIN_ZZ/' -e 's/^STATE=.*/STATE=$MIN_ZZ_STATE_DIR/' "$BIN" > "$T/tool-b/min-zz"
+    grep -qx 'TOOL=min-zz' "$T/tool-b/min-zz" || fail "tool b not made"
+}
+run_b() { MIN_ZZ_STATE_DIR=$T/state-b sh "$T/tool-b/min-zz" "$@" > "$T/out" 2> "$T/err" < /dev/null; RC=$?; }
+
+case_sshconfig_two_tools_coexist() {
+    make_tool_b
+    : > "$T/opted.ssh"
+    for start in none existing; do
+        # shellcheck disable=SC2086  # word-split on purpose
+        for order in "a b a b" "a b b a" "b a a b" "b a b a"; do
+            rm -rf "$HOME/.ssh" "$HOME/.local/state/min-clients"
+            [ "$start" = none ] || existing_config
+            set -- $order
+            for t in "$1" "$2"; do
+                if [ "$t" = a ]; then run ssh-config; else run_b ssh-config; fi
+                assert_rc 0
+            done
+            assert_file_contains "$HOME/.ssh/config" "Include ~/.ssh/min-zed.conf"
+            assert_file_contains "$HOME/.ssh/config" "Include ~/.ssh/min-zz.conf"
+            first=$3
+            for t in "$3" "$4"; do
+                if [ "$t" = a ]; then run ssh-config --remove; else run_b ssh-config --remove; fi
+                assert_rc 0
+                [ "$t" = "$first" ] || continue
+                if [ "$t" = a ]; then o=min-zz; else o=min-zed; fi
+                assert_file_contains "$HOME/.ssh/config" "Include ~/.ssh/$o.conf"
+                [ -f "$HOME/.ssh/$o.conf" ] || fail "$start/$order: $o.conf removed by the other tool"
+            done
+            if [ "$start" = none ]; then
+                assert_no_file "$HOME/.ssh"
+            else
+                cmp -s "$T/orig.config" "$HOME/.ssh/config" || fail "$start/$order: config not restored byte for byte"
+            fi
+            assert_no_file "$CREATED"
+        done
+    done
+}
+
+# Another tool's PREP on the same box: one host key, its own authorized_keys.
+case_prep_two_tools_share_host_key() {
+    run_prep "$T/p1" || fail "PREP failed: $(cat "$T/p1.err")"
+    HOME=$T/box sh -c "$(prep_script)" min-zz "ssh-ed25519 AAAAZZ zz" > "$T/p2" 2> "$T/p2.err" < /dev/null \
+        || fail "PREP as min-zz failed: $(cat "$T/p2.err")"
+    assert_log_count 1 "ssh-keygen"
+    [ "$(grep '^hostkey=' "$T/p1")" = "$(grep '^hostkey=' "$T/p2")" ] || fail "tools got different host keys"
+    assert_file "$T/box/.ssh/min-zed/authorized_keys" "ssh-ed25519 AAAAUSER user"
+    assert_file "$T/box/.ssh/min-zz/authorized_keys" "ssh-ed25519 AAAAZZ zz"
+    HOME=$T/box sh -c "$(prep_script)" '../x' "k" > "$T/p3" 2> "$T/p3.err" < /dev/null && fail "PREP took a tool name with a slash"
+    return 0
+}
+
+# activate_session passes the user's default_loadouts on (min drops them once
+# --loadout is named), then zed last and once.
+case_activate_keeps_default_loadouts() {
+    install_ssh
+    mkdir -p "$HOME/.config/minimal"
+    printf '[loadouts]\ndefault_loadouts = ["mine", "zed"]  # x\n' > "$HOME/.config/minimal/config.toml"
+    sessions_after proj-amber "$P"
+    run open "$P"
+    assert_rc 0
+    assert_log_contains "min session activate --no-prompt --loadout mine --loadout zed -n proj-amber $P"
+}
+
+# Safety: no test may let the CLI reach a real zed/osascript/herdr/min/ssh-keygen.
+# Every override is a stub under $T or a nonexistent absolute path; bare
+# names would resolve through the kernel's /opt/homebrew/bin PATH fallback.
+case_tests_use_absolute_tool_paths() {
+    bad=$(grep -nE '(^|[[:space:];])(ZED|OSASCRIPT|HERDR|MIN|SSH_KEYGEN)_BIN=[^$/%]' "$ROOT/tests/run.sh" | grep -v 'grep -nE') || :
+    [ -z "$bad" ] || fail "tool override not absolute: $bad"
+    for v in "$ZED_BIN" "$OSASCRIPT_BIN" "$HERDR_BIN" "$MIN_BIN" "$SSH_KEYGEN_BIN"; do
+        case $v in "$T"/bin/*) ;; *) fail "setup leaves a tool outside the stubs: $v" ;; esac
+    done
 }
 
 # ==== runner ======================================================================
@@ -1492,6 +1576,7 @@ watch_polls_only_connected_boxes watch_notifies_on_change_only watch_first_sight
 watch_rejects_odd_state_lines watch_pid_file_and_stop
 loadout_parses_with_packages loadout_env_and_workbench_line loadout_claude_hook_records_state
 doctor_rows completions_parse kernel_sha_pinned
+sshconfig_two_tools_coexist prep_two_tools_share_host_key activate_keeps_default_loadouts tests_use_absolute_tool_paths
 "
 
 # The second pass reruns these with a long HOST_PREFIX (a sed copy of the CLI).

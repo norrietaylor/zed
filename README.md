@@ -52,9 +52,10 @@ min-zed doctor
 ```
 
 `just install` adds a marked `Include ~/.ssh/min-zed.conf` at the top of
-`~/.ssh/config` (backed up first) and does **not** touch your
-`default_loadouts`: min-zed activates every session with `--loadout zed`.
-`just uninstall` takes all of it back out.
+`~/.ssh/config` (backed up first; other min-<client> tools' Includes live
+beside it) and does **not** edit your `config.toml`: min-zed activates every
+session with your `default_loadouts` plus `--loadout zed` last. `just
+uninstall` takes all of it back out.
 
 ## Quick start
 

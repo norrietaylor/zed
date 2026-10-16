@@ -21,7 +21,7 @@ install: && loadout ssh-config zed-config
     ln -sfn "$PWD/bin/min-zed" "$HOME/.local/bin/min-zed"
     @echo "linked $HOME/.local/bin/min-zed -> $PWD/bin/min-zed"
 
-# Link loadouts/zed.toml into the Minimal config as loadout `zed` (default_loadouts is left alone).
+# Link loadouts/zed.toml into the Minimal config as loadout `zed` (config.toml is left alone).
 loadout:
     #!/bin/sh
     set -eu
@@ -69,5 +69,5 @@ uninstall:
 kernel-sha:
     #!/bin/sh
     set -eu
-    sed -n '/^# --- kernel begin/,/^# --- kernel end ---$/p' bin/min-zed | shasum -a 256 | cut -d' ' -f1 > tests/kernel.sha
+    sh tests/kernel-sha.sh bin/min-zed > tests/kernel.sha
     echo "tests/kernel.sha: $(cat tests/kernel.sha)"

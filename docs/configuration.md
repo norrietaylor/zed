@@ -33,9 +33,10 @@ shell rc, so nothing may depend on your shell.
   into `~/.claude/settings.json` for the Claude Code events, removing only its
   own earlier entries.
 
-min-zed activates every session with `--loadout zed`, which makes min ignore
-`default_loadouts`; install never edits `config.toml`. Add your own loadouts
-by activating with `min` yourself, then `min-zed attach NAME`.
+min-zed activates every session with each loadout in your `[loadouts]
+default_loadouts`, then `--loadout zed` last (naming any `--loadout` makes min
+skip `default_loadouts`, so min-zed passes them on itself); install never
+edits `config.toml`.
 
 ## State dir
 
@@ -47,7 +48,11 @@ by activating with `min` yourself, then `min-zed attach NAME`.
 | `cache/NAME.agent` | last agent state seen (`state epoch`) |
 | `orphan/NAME`, `kept/NAME` | when a session was first seen unused; when you kept it at a prompt |
 | `backups/` | `ssh_config.*` before each `~/.ssh/config` write, `zed-settings.json.*` before each settings write |
-| `ssh-config-created`, `zed-config-installed` | what install created; the settings-sync opt-in |
+| `zed-config-installed` | the settings-sync opt-in |
+
+What the first min-<client> `ssh-config` created under `~/.ssh` (`dir`,
+`config`) is recorded in `~/.local/state/min-clients/ssh-config-created`,
+shared by every tool: whichever removes the last Include deletes those.
 
 ## Rolling back
 

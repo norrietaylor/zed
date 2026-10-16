@@ -92,6 +92,9 @@ text passed as AppleScript arguments, never spliced into the script.
 
 Everything above the `# --- kernel end ---` line in `bin/min-zed` (from
 `# --- kernel begin …`) is vendored byte for byte from the min-cmux repo and
-pinned by `tests/kernel.sha`; the Zed layer below it uses only the functions
-and hooks in the kernel contract (`client_on_connect` refreshes Zed's
-settings, `client_on_destroy` drops the entry and the cached state).
+pinned by `tests/kernel.sha` (`tests/kernel-sha.sh` computes it); the Zed
+layer below it uses only the functions and hooks in the kernel contract. The
+kernel calls client hooks through `hook NAME` only when the client defines
+them: min-zed defines `client_on_connect` (refresh Zed's settings) and
+`client_on_destroy` (drop the entry and the cached state), and leaves
+`client_linked` undefined (Zed's connection already shows in `box_in_use`).
