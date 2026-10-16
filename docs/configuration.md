@@ -9,6 +9,9 @@
 | `MIN_ZED_INTERVAL` | `5` | seconds between watch polls |
 | `MIN_ZED_PREFETCH` | `0` | `1`: pre-fetch Zed's remote server on `open`/`new` (unverified, spike Z1) |
 | `MIN_ZED_NO_WATCH` | unset | `1`: `open`/`attach` do not start the watch |
+| `MIN_ZED_EXEC_TIMEOUT` | `10` | seconds one agent-state read may take |
+| `MIN_NO_PATH_EXTEND` | unset | `1`: do not append Homebrew and `~/.local/bin` to PATH (tests) |
+| `MIN_LOCK_WAIT` | `10` | seconds `ssh-config` waits for the shared lock |
 | `MIN_ZED_DEBUG` | unset | non-empty: extra `[min-zed]` lines on stderr |
 | `MIN_BIN` | `min` on PATH | absolute path baked into every stanza |
 | `ZED_BIN` | `zed` | the Zed CLI |
@@ -49,6 +52,8 @@ edits `config.toml`.
 | `orphan/NAME`, `kept/NAME` | when a session was first seen unused; when you kept it at a prompt |
 | `backups/` | `ssh_config.*` before each `~/.ssh/config` write, `zed-settings.json.*` before each settings write |
 | `zed-config-installed` | the settings-sync opt-in |
+| `zed-config.json` | whether min-zed created Zed's settings file / added its `ssh_connections` key |
+| `watch.lock`, `cache/NAME.notified` | one watch per state dir; last notification per box |
 
 What the first min-<client> `ssh-config` created under `~/.ssh` (`dir`,
 `config`) is recorded in `~/.local/state/min-clients/ssh-config-created`,

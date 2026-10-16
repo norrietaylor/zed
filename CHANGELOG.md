@@ -25,6 +25,20 @@ First release, split from [minx](https://github.com/noric-labs/minx).
 - Loadout `zed`: openssh, curl, jq, rsync, xxhash; sshd environment;
   `min:workbench` rc line; Claude Code hook.
 
+### Fixed (review, before release)
+
+- Watch: epochs with a leading zero or more than 12 digits are refused
+  instead of stopping the loop; reads are capped at 512 bytes and time out
+  (`MIN_ZED_EXEC_TIMEOUT`); at most one notification per box per minute;
+  bidi/line-separator characters stripped, messages cut by characters; one
+  watch per state dir; `watch --ensure` no longer claims a start that did not
+  happen; `watch.log` trimmed.
+- Settings: comments between `ssh_connections` entries, CRLF and a BOM are
+  kept; atomic replace; `--remove` deletes a file min-zed created and keeps a
+  user's own empty list; `zed-config --print` fails when the file cannot be
+  edited.
+- `gc` re-checks a session right before asking about it (kernel v2).
+
 ### Changed (from minx)
 
 - Host alias `min-zed.NAME` (was `min.NAME`); state in

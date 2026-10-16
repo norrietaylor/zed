@@ -19,7 +19,7 @@ case "${1:-} ${2:-}" in
     "session exec")
         # prepare:  min session exec NAME sh -c PREP min-zed PUBKEY
         # prefetch: min session exec NAME sh -c LAUNCH min-zed FETCH VERSION (logged only)
-        # poll:     min session exec NAME cat PATH -> $FIXTURES/agent-state.NAME
+        # poll:     min session exec NAME head -c 512 PATH -> $FIXTURES/agent-state.NAME
         # anything else (the _proxy sshd argv): echo it, as the ssh byte stream
         if [ "${4:-}" = sh ] && [ $# -ge 9 ]; then
             exit 0
@@ -27,7 +27,11 @@ case "${1:-} ${2:-}" in
             printf '%s' "$8" > "$STUB_LOG.pubkey"
             [ ! -f "$FIXTURES/exec.hook" ] || sh "$FIXTURES/exec.hook"   # e.g. a session appears meanwhile
             cat "$FIXTURES/facts.txt"
-        elif [ "${4:-}" = cat ]; then
+        elif [ "${4:-}" = head ]; then
+            # $FIXTURES/exec.hang.NAME: the box never answers (one process, like min)
+            [ ! -f "$FIXTURES/exec.hang.$3" ] || exec sleep 30
+            # $FIXTURES/exec.stream.NAME: a box that ignores `head -c` and streams one endless line
+            if [ -f "$FIXTURES/exec.stream.$3" ]; then { cat "$FIXTURES/agent-state.$3"; yes A; } | tr -d '\n'; exit 0; fi
             cat "$FIXTURES/agent-state.$3" 2>/dev/null
         else
             printf 'sshd-stub'; printf ' [%s]' "$@"; echo

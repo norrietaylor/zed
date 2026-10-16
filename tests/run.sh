@@ -29,16 +29,24 @@ setup() {
     AP=$T/alpha-proj   # project dir of the pre-existing session "alpha"
     mkdir -p "$HOME" "$STATE" "$FIXTURES" "$T/bin" "$P" "$AP"
     : > "$STUB_LOG"
-    for s in min zed ssh ssh-keygen ps osascript herdr; do ln -s "$STUBS/$s" "$T/bin/$s"; done
+    for s in min ssh ssh-keygen ps; do ln -s "$STUBS/$s" "$T/bin/$s"; done
+    # Never reached by bare name in a test: a call lands in $TRIPWIRE_LOG and
+    # fails the case. zed, osascript and herdr are reachable only through
+    # their *_BIN stubs in $T/stub-bin, which is not on PATH; curl only where a
+    # case swaps in its stub.
+    for s in open osascript zed code cursor windsurf herdr curl; do ln -s "$STUBS/tripwire" "$T/bin/$s"; done
+    mkdir -p "$T/stub-bin"
+    for s in zed osascript herdr; do ln -s "$STUBS/$s" "$T/stub-bin/$s"; done
+    TRIPWIRE_LOG=$T/tripwire
     PATH=$T/bin:/usr/bin:/bin
-    MIN_BIN=$T/bin/min SSH_KEYGEN_BIN=$T/bin/ssh-keygen ZED_BIN=$T/bin/zed OSASCRIPT_BIN=$T/bin/osascript
-    HERDR_BIN=$T/bin/herdr
-    MIN_ZED_STATE_DIR=$STATE MIN_ZED_NO_WATCH=1 MIN_ZED_SETTINGS=$T/zed/settings.json
+    MIN_BIN=$T/bin/min SSH_KEYGEN_BIN=$T/bin/ssh-keygen ZED_BIN=$T/stub-bin/zed OSASCRIPT_BIN=$T/stub-bin/osascript
+    HERDR_BIN=$T/stub-bin/herdr
+    MIN_ZED_STATE_DIR=$STATE MIN_ZED_NO_WATCH=1 MIN_ZED_SETTINGS=$T/zed/settings.json MIN_NO_PATH_EXTEND=1
     ZS=$MIN_ZED_SETTINGS
     CREATED=$HOME/.local/state/min-clients/ssh-config-created   # shared by every min-<client> tool
-    unset MIN_ZED_PREFETCH MIN_ZED_DEBUG XDG_CONFIG_HOME XDG_STATE_HOME
+    unset MIN_ZED_PREFETCH MIN_ZED_DEBUG XDG_CONFIG_HOME XDG_STATE_HOME ZDOTDIR VISUAL EDITOR
     export HOME PATH STUB_LOG FIXTURES MIN_BIN SSH_KEYGEN_BIN ZED_BIN OSASCRIPT_BIN HERDR_BIN \
-        MIN_ZED_STATE_DIR MIN_ZED_NO_WATCH MIN_ZED_SETTINGS
+        MIN_ZED_STATE_DIR MIN_ZED_NO_WATCH MIN_ZED_SETTINGS MIN_NO_PATH_EXTEND TRIPWIRE_LOG
     default_fixtures
 }
 
@@ -79,7 +87,7 @@ run_stdin() {
 # run_cfg ARGS...: bin/min-zed-config against $ZS, backups under $STATE/backups.
 run_cfg() {
     : > "$T/opted.zed"
-    python3 "$CFG" --settings "$ZS" --backup-dir "$STATE/backups" "$@" > "$T/out" 2> "$T/err" < /dev/null
+    python3 "$CFG" --settings "$ZS" --backup-dir "$STATE/backups" --record "$STATE/zed-config.json" "$@" > "$T/out" 2> "$T/err" < /dev/null
     RC=$?
 }
 
@@ -902,7 +910,7 @@ case_open_name_for_other_dir_fails() {
 case_open_without_zed_cli_says_where() {
     install_ssh
     # an absolute path that does not exist: a bare `zed` would find a real one via the PATH fallback
-    rm "$T/bin/zed"; ZED_BIN=$T/no-such-zed; export ZED_BIN
+    ZED_BIN=$T/no-such-zed; export ZED_BIN
     sessions_after proj-amber "$P"
     run open "$P"
     assert_rc 1
@@ -1135,7 +1143,7 @@ fetch_script() { sed -n "/^FETCH='/,/'\$/p" "$BIN" | sed -e "1s/^FETCH='//" -e "
 launch_script() { sed -n "/^LAUNCH='/,/'\$/p" "$BIN" | sed -e "1s/^LAUNCH='//" -e "\$s/'\$//"; }
 
 case_fetch_script_installs_atomically() {
-    ln -s "$STUBS/curl" "$T/bin/curl"
+    rm "$T/bin/curl"; ln -s "$STUBS/curl" "$T/bin/curl"
     mkdir -p "$T/box"
     fetch_script | grep -q 'zed-remote-server-stable-' || fail "fetch_script did not cut FETCH out"
     HOME=$T/box sh -c "$(fetch_script)" f 1.22.0 < /dev/null || fail "FETCH failed"
@@ -1206,7 +1214,7 @@ case_inuse_herdr_bridge_needs_agents() {
   200     1 ssh -C -F /tmp/herdr-ssh/config -o ControlMaster=auto -T box@min-herdr.gamma $br
   201   200 /opt/homebrew/bin/min session exec gamma /usr/sbin/sshd -i -e
 EOF
-    printf '{"result":{"agents":[{"agent":"claude"}],"type":"agent_list"}}\n' > "$FIXTURES/herdr.agents.min-herdr.beta.json"
+    printf '{"result":{"agents":[{"agent":"claude"}],"type":"agent_list"}}\n' > "$FIXTURES/herdr.agents.beta.json"
     run gc --dry-run
     ! grep -q '^beta ' "$T/out" || fail "beta has an agent: in use"
     grep -q '^gamma ' "$T/out" || fail "a bridge without agents is not use"
@@ -1292,7 +1300,7 @@ case_watch_polls_only_connected_boxes() {
     own_sessions
     connected beta
     run_watch
-    assert_log_contains "min session exec beta cat /home/.min-zed/agent-state"
+    assert_log_contains "min session exec beta head -c 512 /home/.min-zed/agent-state"
     assert_log_not_contains "session exec gamma"
     assert_log_not_contains "session exec alpha"
     assert_log_not_contains "session exec cmuxbox"
@@ -1334,6 +1342,18 @@ case_watch_rejects_odd_state_lines() {
     printf 'needs-input notanumber x\n' > "$FIXTURES/agent-state.beta"
     run_watch
     assert_log_not_contains "osascript"
+    for w in 'needs' 'NEEDS-INPUT' 'finished2' 'Finished'; do
+        printf '%s %s x\n' "$w" "$(date +%s)" > "$FIXTURES/agent-state.beta"
+        run_watch
+        assert_log_not_contains "osascript"
+    done
+    # the allowlist is exactly these six words, as the loadout's hook writes them
+    # shellcheck disable=SC2016  # a literal $st in the pattern
+    words=$(sed -n 's/^    case \$st in \([a-z|-]*\)) ;; \*) dbg .*/\1/p' "$BIN")
+    [ "$words" = "started|working|needs-input|finished|idle|clear" ] || fail "state allowlist changed: '$words'"
+    for w in started working needs-input finished idle clear; do
+        grep -q "record $w" "$ROOT/loadouts/zed.toml" || fail "loadout hook never writes $w"
+    done
 }
 
 case_watch_pid_file_and_stop() {
@@ -1537,8 +1557,325 @@ case_tests_use_absolute_tool_paths() {
     bad=$(grep -nE '(^|[[:space:];])(ZED|OSASCRIPT|HERDR|MIN|SSH_KEYGEN)_BIN=[^$/%]' "$ROOT/tests/run.sh" | grep -v 'grep -nE') || :
     [ -z "$bad" ] || fail "tool override not absolute: $bad"
     for v in "$ZED_BIN" "$OSASCRIPT_BIN" "$HERDR_BIN" "$MIN_BIN" "$SSH_KEYGEN_BIN"; do
-        case $v in "$T"/bin/*) ;; *) fail "setup leaves a tool outside the stubs: $v" ;; esac
+        case $v in "$T"/bin/min|"$T"/bin/ssh-keygen|"$T"/stub-bin/*) ;; *) fail "setup leaves a tool outside the stubs: $v" ;; esac
     done
+}
+
+# ---- review fixes (zed layer) ----
+
+# Z1: an epoch with a leading zero or too many digits is refused, and the
+# watch goes on to the next box (no $((0999)) arithmetic error).
+case_watch_odd_epochs_do_not_stop_it() {
+    own_sessions
+    connected beta gamma
+    printf 'needs-input 0999 x\n' > "$FIXTURES/agent-state.beta"
+    printf 'needs-input 1234567890123 x\n' > "$FIXTURES/agent-state.alpha"
+    printf 'needs-input %s go\n' "$(date +%s)" > "$FIXTURES/agent-state.gamma"
+    run_watch
+    assert_log_count 1 "osascript | min-zed | gamma: needs input | go"
+    assert_log_not_contains "beta:"
+    ! grep -qi 'arithmetic\|syntax error' "$T/err" || fail "watch hit an arithmetic error: $(cat "$T/err")"
+}
+
+# Z2: comments between other entries survive a sync and a --remove.
+case_zedcfg_keeps_comments_between_entries() {
+    mkdir -p "$T/zed"
+    cat > "$ZS" <<'EOF'
+{
+  "ssh_connections": [
+    // work box
+    {"host": "box.example"}, // a, b
+    // ours
+    {"host": "min-zed.gone"},
+    /* keep me */
+    {"host": "other.example"}, // trailing note
+  ],
+}
+EOF
+    run_cfg alpha
+    assert_rc 0
+    for t in '// work box' '{"host": "box.example"}, // a, b' '/* keep me */' '{"host": "other.example"}, // trailing note'; do
+        assert_file_contains "$ZS" "$t"
+    done
+    [ "$(cfg_hosts)" = "box.example other.example min-zed.alpha" ] || fail "hosts: $(cfg_hosts)"
+    run_cfg --remove
+    assert_file_contains "$ZS" '{"host": "other.example"}, // trailing note'
+    [ "$(cfg_hosts)" = "box.example other.example" ] || fail "hosts: $(cfg_hosts)"
+}
+
+# Z3: a CRLF file stays CRLF, and --remove gives it back byte for byte.
+case_zedcfg_crlf_kept() {
+    mkdir -p "$T/zed"
+    printf '{\r\n  "theme": "x"\r\n}\r\n' > "$ZS"; cp "$ZS" "$T/orig.settings"
+    run_cfg alpha beta
+    assert_rc 0
+    python3 -c 'import sys; t = open(sys.argv[1], "rb").read(); sys.exit(t.count(b"\n") != t.count(b"\r\n"))' "$ZS" \
+        || fail "a line lost its CR: $(od -c "$ZS" | head)"
+    [ "$(cfg_hosts)" = "min-zed.alpha min-zed.beta" ] || fail "hosts: $(cfg_hosts)"
+    run_cfg --remove
+    cmp -s "$ZS" "$T/orig.settings" || fail "CRLF file not restored byte for byte"
+}
+
+# Z6: written by one rename beside the real file; its mode kept, no temp left.
+case_zedcfg_atomic_write_keeps_mode() {
+    mkdir -p "$T/zed" "$T/dot"
+    printf '{}\n' > "$T/dot/settings.json"; chmod 640 "$T/dot/settings.json"
+    ln -s "$T/dot/settings.json" "$ZS"
+    run_cfg alpha
+    assert_rc 0
+    [ -L "$ZS" ] || fail "symlink replaced"
+    assert_mode "$T/dot/settings.json" 640
+    [ -z "$(find "$T/dot" "$T/zed" -name '.settings.json.*')" ] || fail "temp file left"
+}
+
+# Z7: a settings file we created goes again on --remove; a user's own empty
+# ssh_connections list stays.
+case_zedcfg_remove_undoes_only_what_we_made() {
+    run_cfg alpha
+    assert_file "$ZS"
+    run_cfg --remove
+    assert_rc 0
+    assert_no_file "$ZS"
+    mkdir -p "$T/zed"
+    printf '{\n  "ssh_connections": [],\n  "theme": "x"\n}\n' > "$ZS"; cp "$ZS" "$T/orig.settings"
+    run_cfg alpha
+    run_cfg --remove
+    cmp -s "$ZS" "$T/orig.settings" || { fail "user's empty list not kept as it was"; sed 's/^/#   zs: /' "$ZS" >&2; }
+    # created by us, then the user added a setting: kept
+    rm -f "$ZS" "$STATE/zed-config.json"
+    run_cfg alpha
+    printf '{\n  "theme": "y",\n  "ssh_connections": [{"host": "min-zed.alpha"}]\n}\n' > "$ZS"
+    run_cfg --remove
+    assert_file_contains "$ZS" '"theme": "y"'
+}
+
+# Z8: `zed-config --print` fails when the merger cannot edit the file.
+case_zedcfg_print_propagates_failure() {
+    install_ssh
+    mkdir -p "$T/zed"; : > "$T/opted.zed"
+    printf '{"ssh_connections": {"host": "x"}}\n' > "$ZS"
+    run zed-config --print
+    assert_rc 1
+    assert_err_contains "ssh_connections is not a list"
+}
+
+# Z9: at most one notification per box per minute; bidi controls and line
+# separators stripped; the message cut at 200 characters, not bytes. The box
+# read is bounded (512 bytes).
+case_watch_notifications_rate_limited_and_clean() {
+    own_sessions
+    connected beta
+    now=$(date +%s)
+    msg=$(printf 'ok\342\200\256evil\342\201\246x\342\200\250y')
+    printf 'needs-input %s %s\n' "$now" "$msg" > "$FIXTURES/agent-state.beta"
+    MIN_ZED_INTERVAL=1 sh "$BIN" watch > "$T/out" 2> "$T/err" < /dev/null &
+    wp=$!
+    sleep 1.5
+    printf 'finished %s done\n' "$((now + 1))" > "$FIXTURES/agent-state.beta"
+    sleep 2
+    kill "$wp"; wait "$wp" 2>/dev/null
+    assert_log_count 1 "osascript |"
+    assert_log_contains "osascript | min-zed | beta: needs input | okevilxy"
+    assert_log_contains "min session exec beta head -c 512 /home/.min-zed/agent-state"
+    # characters, not bytes: 300 two-byte characters come out as 200
+    rm -f "$STATE/cache/beta.notified"
+    long=$(python3 -c 'print("é" * 300, end="")')
+    printf 'finished %s %s\n' "$((now + 2))" "$long" > "$FIXTURES/agent-state.beta"
+    reset_log
+    run_watch
+    body=$(sed -n 's/^osascript | min-zed | beta: finished | Claude finished: //p' "$STUB_LOG")
+    [ "$(printf '%s' "$body" | python3 -c 'import sys; print(len(sys.stdin.buffer.read().decode()))')" = 200 ] \
+        || fail "body not cut at 200 characters: $(printf '%s' "$body" | wc -c) bytes"
+}
+
+# A box that never answers costs one exec timeout, not the watch: the next
+# box in the same tick is still read.
+case_watch_hanging_box_times_out() {
+    own_sessions
+    connected beta gamma
+    : > "$FIXTURES/exec.hang.beta"
+    printf 'needs-input %s go\n' "$(date +%s)" > "$FIXTURES/agent-state.gamma"
+    MIN_ZED_EXEC_TIMEOUT=1; export MIN_ZED_EXEC_TIMEOUT
+    run_watch
+    assert_log_count 1 "osascript | min-zed | gamma: needs input | go"
+    pkill -f "sleep 30" 2>/dev/null || :
+}
+
+# A box that ignores the in-box `head -c` and streams forever is cut at 512
+# bytes on the host, well before the exec timeout.
+case_watch_streaming_box_capped_on_host() {
+    own_sessions
+    connected beta
+    printf 'needs-input %s msg' "$(date +%s)" > "$FIXTURES/agent-state.beta"
+    : > "$FIXTURES/exec.stream.beta"
+    MIN_ZED_EXEC_TIMEOUT=30; export MIN_ZED_EXEC_TIMEOUT
+    run_watch
+    body=$(sed -n 's/^osascript | min-zed | beta: needs input | //p' "$STUB_LOG")
+    case $body in msgAAAA*) ;; *) fail "no capped notification: $(cat "$STUB_LOG")" ;; esac
+    [ "${#body}" -le 200 ] || fail "body ${#body} long"
+}
+
+# A stale watch.lock and a pid file naming some other live process (a reused
+# pid) do not keep the watch from starting; --ensure reports a real start only.
+case_watch_stale_lock_and_reused_pid() {
+    mkdir -p "$STATE/watch.lock"
+    sleep 30 & other=$!
+    printf '%s' "$other" > "$STATE/watch.pid"
+    MIN_ZED_INTERVAL=1 sh "$BIN" watch > "$T/out" 2> "$T/err" < /dev/null & wp=$!
+    sleep 1.5
+    kill -0 "$wp" 2>/dev/null || fail "watch did not start: $(cat "$T/err")"
+    assert_file "$STATE/watch.pid" "$wp"
+    kill "$wp" "$other" 2>/dev/null; wait 2>/dev/null
+    # --ensure with the watch unable to start: no success claimed
+    MIN_ZED_NO_WATCH=; export MIN_ZED_NO_WATCH
+    rm -f "$STATE/watch.pid"; rmdir "$STATE/watch.lock" 2>/dev/null
+    mkdir "$STATE/watch.log"      # the background start cannot open its log
+    run watch --ensure
+    assert_rc 1
+    assert_err_contains "watch did not start; see $STATE/watch.log"
+    ! grep -q 'watch started' "$T/out" || fail "--ensure claimed a start"
+}
+
+# A BOM stays in front, and --remove restores the file byte for byte.
+case_zedcfg_bom_kept() {
+    mkdir -p "$T/zed"
+    printf '\357\273\277{\n  "a": 1\n}\n' > "$ZS"; cp "$ZS" "$T/orig.settings"
+    run_cfg x
+    assert_rc 0
+    head -c 3 "$ZS" | od -c | grep -q '357 273 277' || fail "BOM lost"
+    run_cfg --remove
+    cmp -s "$ZS" "$T/orig.settings" || fail "BOM file not restored byte for byte"
+}
+
+# Z5: two watches started at once: one survives and owns the pid file.
+case_watch_double_start_leaves_one() {
+    MIN_ZED_INTERVAL=1 sh "$BIN" watch > "$T/w1" 2>&1 < /dev/null & w1=$!
+    MIN_ZED_INTERVAL=1 sh "$BIN" watch > "$T/w2" 2>&1 < /dev/null & w2=$!
+    sleep 2.5
+    alive=0
+    for p in $w1 $w2; do kill -0 "$p" 2>/dev/null && alive=$((alive + 1)); done
+    [ "$alive" = 1 ] || fail "$alive watches running"
+    for p in $w1 $w2; do kill -0 "$p" 2>/dev/null && { [ "$(cat "$STATE/watch.pid")" = "$p" ] || fail "pid file names the other watch"; }; done
+    kill "$w1" "$w2" 2>/dev/null; wait 2>/dev/null
+    assert_no_file "$STATE/watch.pid"
+    assert_no_file "$STATE/watch.lock"
+}
+
+# Z10: watch.log is trimmed like proxy.log.
+case_watch_log_trimmed() {
+    i=0; while [ $i -lt 1500 ]; do echo "old $i"; i=$((i + 1)); done > "$STATE/watch.log"
+    run_watch
+    n=$(($(wc -l < "$STATE/watch.log")))
+    [ "$n" -le 1000 ] || fail "watch.log not trimmed: $n lines"
+    grep -qx 'old 1499' "$STATE/watch.log" || fail "newest lines lost"
+}
+
+# ---- kernel v2 (ported from cmux) ----
+
+case_gc_herdr_agent_list_failure_counts() {
+    own_sessions
+    age beta 200000
+    br='printf ready\012exec /usr/bin/herdr remote-client-bridge --idle-timeout-v1'
+    printf '300 1 ssh -T min-herdr.beta %s\n301 300 /opt/homebrew/bin/min session exec beta /usr/sbin/sshd -i\n' "$br" > "$FIXTURES/ps.txt"
+    : > "$FIXTURES/herdr.agents.beta.fail"
+    run gc --dry-run
+    ! grep -q '^beta ' "$T/out" || fail "a box Herdr could not ask about was offered"
+    run gc --dry-run
+    assert_log_count 2 "herdr --machine min-herdr.beta agent list"
+    assert_no_file "$STATE/herdr.agents/beta"
+    rm "$FIXTURES/herdr.agents.beta.fail"
+    run gc --dry-run
+    grep -q '^beta ' "$T/out" || fail "beta has no agents once Herdr answers"
+}
+
+case_open_default_loadouts_toml_forms() {
+    install_ssh
+    mkdir -p "$HOME/.config/minimal"
+    sessions_after proj-amber "$P"
+    printf "loadouts.default_loadouts = ['dots', \"minx\"]\n[loadouts]\nx = 1\n" > "$HOME/.config/minimal/config.toml"
+    run open "$P"
+    assert_rc 0
+    assert_log_contains "min session activate --no-prompt --loadout dots --loadout zed -n proj-amber $P"
+    assert_err_contains "not passing default loadout minx"
+    printf "[ loadouts ]\ndefault_loadouts = [ 'a.b', 'x y' ]\n" > "$HOME/.config/minimal/config.toml"
+    printf '{"sessions":[]}\n' > "$FIXTURES/sessions.json"; reset_log
+    run open "$P"
+    assert_log_contains "min session activate --no-prompt --loadout a.b --loadout zed -n proj-amber $P"
+    assert_err_contains "ignoring default loadout 'x y'"
+    printf '[loadouts]\ndefault_loadouts = [dots]\n' > "$HOME/.config/minimal/config.toml"
+    printf '{"sessions":[]}\n' > "$FIXTURES/sessions.json"; reset_log
+    run open "$P"
+    assert_log_contains "min session activate --no-prompt --loadout zed -n proj-amber $P"
+    assert_err_contains "could not read default_loadouts in $HOME/.config/minimal/config.toml"
+}
+
+case_sshconfig_lock_held_waits_then_fails() {
+    L=$HOME/.local/state/min-clients/ssh-config.lock
+    mkdir -p "$L"
+    MIN_LOCK_WAIT=1 run ssh-config
+    assert_rc 1
+    assert_err_contains "$L is held by another ssh-config run"
+    assert_no_file "$HOME/.ssh/config"
+    [ -d "$L" ] || fail "a waiter removed a lock it does not hold"
+    touch -t 200001010000 "$L"
+    MIN_LOCK_WAIT=1 run ssh-config
+    assert_rc 0
+    assert_file_contains "$HOME/.ssh/config" "Include ~/.ssh/min-zed.conf"
+    assert_no_file "$L"
+    MIN_LOCK_WAIT=1 run ssh-config --remove
+    assert_rc 0
+    assert_no_file "$HOME/.ssh"
+    assert_no_file "$HOME/.local/state/min-clients"
+}
+
+case_sshconfig_two_tools_install_at_once() {
+    make_tool_b
+    : > "$T/opted.ssh"
+    r=0; while [ "$r" -lt 4 ]; do
+        rm -rf "$HOME/.ssh" "$HOME/.local/state/min-clients"
+        sh "$BIN" ssh-config > "$T/a.out" 2>&1 < /dev/null & a=$!
+        MIN_ZZ_STATE_DIR=$T/state-b sh "$T/tool-b/min-zz" ssh-config > "$T/b.out" 2>&1 < /dev/null & b=$!
+        wait "$a" || fail "round $r: a failed: $(cat "$T/a.out")"
+        wait "$b" || fail "round $r: b failed: $(cat "$T/b.out")"
+        for t in min-zed min-zz; do
+            [ "$(grep -cxF "Include ~/.ssh/$t.conf" "$HOME/.ssh/config")" = 1 ] || fail "round $r: $t Include lost: $(cat "$HOME/.ssh/config")"
+        done
+        r=$((r + 1))
+    done
+}
+
+# K7: gc looks again right before each question.
+case_gc_rechecks_before_each_question() {
+    own_sessions
+    age alpha 400
+    age beta 300
+    age gamma 200
+    printf '100 1 ssh min-zed.gamma\n101 100 /opt/homebrew/bin/min session exec gamma /usr/sbin/sshd -i\n' > "$FIXTURES/ps.later.txt"
+    run_stdin 'y
+y
+y
+' gc
+    assert_rc 0
+    grep -q '^gamma ' "$T/out" || fail "gamma was idle when gc listed: $(cat "$T/out")"
+    assert_log_contains "min session destroy beta"
+    assert_log_not_contains "min session destroy gamma"
+    assert_err_contains "gamma is in use now; not asking"
+    ! grep -qF "Destroy Minimal session gamma" "$T/err" || fail "asked about gamma"
+}
+
+case_bad_session_name_refused() {
+    install_ssh
+    cat > "$FIXTURES/sessions.json" <<JSON
+{"sessions":[{"id":"ID-X","name":"x; touch PWN #","project_path":"$AP","status":"active"}]}
+JSON
+    run attach 'x; touch PWN #'
+    assert_rc 1
+    assert_err_contains "session name is not lowercase letters, digits and dashes; not using it"
+    assert_log_not_contains "session exec"
+    assert_log_not_contains "zed ssh://"
+    run ssh 'x; touch PWN #' -- true
+    assert_rc 1
+    assert_log_not_contains "ssh -i"
 }
 
 # ==== runner ======================================================================
@@ -1577,6 +1914,11 @@ watch_rejects_odd_state_lines watch_pid_file_and_stop
 loadout_parses_with_packages loadout_env_and_workbench_line loadout_claude_hook_records_state
 doctor_rows completions_parse kernel_sha_pinned
 sshconfig_two_tools_coexist prep_two_tools_share_host_key activate_keeps_default_loadouts tests_use_absolute_tool_paths
+watch_odd_epochs_do_not_stop_it zedcfg_keeps_comments_between_entries zedcfg_crlf_kept zedcfg_atomic_write_keeps_mode
+zedcfg_remove_undoes_only_what_we_made zedcfg_print_propagates_failure watch_notifications_rate_limited_and_clean
+watch_double_start_leaves_one watch_log_trimmed watch_hanging_box_times_out zedcfg_bom_kept watch_streaming_box_capped_on_host watch_stale_lock_and_reused_pid
+gc_herdr_agent_list_failure_counts open_default_loadouts_toml_forms sshconfig_lock_held_waits_then_fails
+sshconfig_two_tools_install_at_once gc_rechecks_before_each_question bad_session_name_refused
 "
 
 # The second pass reruns these with a long HOST_PREFIX (a sed copy of the CLI).
@@ -1592,6 +1934,7 @@ attach_launches_zed_and_fails_unknown
 guards() {
     [ -e "$T/opted.ssh" ] || [ ! -e "$HOME/.ssh" ] || fail "HOME/.ssh touched without ssh-config: $(find "$HOME/.ssh" | tr '\n' ' ')"
     [ -e "$T/opted.zed" ] || [ ! -e "$T/zed" ] || fail "Zed settings touched without zed-config"
+    [ ! -e "$T/tripwire" ] || fail "tripwire: $(cat "$T/tripwire")"
 }
 
 pass=0 failed=0 skipped=0

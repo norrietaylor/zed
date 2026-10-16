@@ -29,7 +29,9 @@ Trust:
 - **Opt-in edits.** Nothing under `~/.ssh` is touched until
   `min-zed ssh-config`; Zed's settings not until `min-zed zed-config`. Both
   back up before writing and leave every byte outside their own lines/entries
-  as it was (`--remove` restores `~/.ssh/config` byte for byte).
+  as it was, comments between Zed's `ssh_connections` entries included
+  (`--remove` restores `~/.ssh/config` byte for byte, and Zed's settings too
+  when min-zed's additions were the only change).
 - **Explicit destroy.** `destroy` and `gc` never destroy without a typed `y`
   (`destroy -y` is the only way past it).
 

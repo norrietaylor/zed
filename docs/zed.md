@@ -43,13 +43,16 @@ keep it that way afterwards. A new entry is
 
 and an entry you already have for a live session is kept exactly as you wrote
 it, so options such as `"upload_binary_over_ssh": true` (for a box without
-outbound HTTPS) survive. Every other entry and setting is left alone; your
-comments are kept, except comments *inside* the `ssh_connections` array,
-which are dropped when that array is rewritten. Each write is preceded by a
-backup in `~/.local/state/min-zed/backups/` (the newest 20 are kept) and
-skipped when nothing would change. `min-zed zed-config --print` shows the
-result without writing; `--remove` takes every `min-zed.*` entry out (and the
-key itself when only ours were in it).
+outbound HTTPS) survive. Every other entry, setting and comment is left
+alone, including comments between entries in `ssh_connections`: our entries
+are deleted and appended in place, and a CRLF file or a BOM stays as it was.
+Each write is preceded by a backup in `~/.local/state/min-zed/backups/` (the
+newest 20 are kept), replaces the file in one rename, and is skipped when
+nothing would change. `min-zed zed-config --print` shows the result without
+writing; `--remove` takes every `min-zed.*` entry out, the
+`ssh_connections` key too if min-zed added it (a list you had stays, even
+empty), and the whole file if min-zed created it and nothing else is in it
+(`~/.local/state/min-zed/zed-config.json` remembers which).
 
 Settings sync is optional: `zed ssh://` reads `~/.ssh/config`, so Zed reaches
 a session without any entry.
@@ -66,8 +69,13 @@ every 5 s, looks at the host's process list for sessions that have a live
 sshd connection, and for those only runs
 `min session exec NAME cat /home/.min-zed/agent-state`. When the state has
 changed to `needs-input` or `finished` it posts a macOS notification titled
-`min-zed`, subtitle `NAME: needs input` / `NAME: finished`. A box with no
-connection is never asked (asking would start a stopped box).
+`min-zed`, subtitle `NAME: needs input` / `NAME: finished`, at most one per
+box per minute. A box with no connection is never asked (asking would start
+a stopped box). Each read is capped at 512 bytes (in the box and again on the
+host) and killed after `MIN_ZED_EXEC_TIMEOUT` seconds (10); the message loses
+control characters, bidi overrides and line separators and is cut at 200
+characters. One watch runs per state dir (`watch.lock`, `watch.pid`);
+`watch.log` is trimmed to its newest 500 lines past 1000.
 
 `min-zed watch --stop` stops it; `min-zed status` shows the last state seen.
 

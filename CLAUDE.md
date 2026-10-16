@@ -40,16 +40,22 @@ the min-<client> repos (plan of record:
   it has run (`$STATE/zed-config-installed`). Then `client_on_connect`
   (open/new/attach/ssh) and `client_on_destroy` resync; `_proxy` never does.
   Only entries whose host starts `min-zed.` are added or removed; an existing
-  entry of ours is kept verbatim; no write when the parsed result is
-  unchanged; dated backup in `$STATE/backups` before every write; written
-  through (symlinks survive).
+  entry of ours is kept verbatim; every other byte (comments between
+  entries, CRLF, BOM) stays; no write when the parsed result is unchanged;
+  dated backup in `$STATE/backups` before every write; one rename of a temp
+  file beside the realpath (symlinks survive). `--remove` drops the key only
+  if we added it and the file only if we created it and it is empty again
+  (`$STATE/zed-config.json`).
 - The host key is pinned (`StrictHostKeyChecking=yes`); never `accept-new`.
 - Agent and X11 forwarding stay off on every client path: one option list
   (`ssh_common`) feeds both the stanza and `ssh_opts`.
 - Facts the box reports (user, hostkey, home, sshd) are untrusted: `prepare`
   validates them before writing anything, and stored ones are re-checked on
-  read. The agent-state line is validated (state word, numeric epoch, control
-  bytes stripped) and reaches `osascript` only as argv.
+  read. The agent-state line is read with `head -c 512` in the box and on the
+  host, under `with_timeout` (which backgrounds `$MIN` itself, never a shell
+  function), validated (allowlisted state word, epoch digits without a
+  leading zero, at most 12), cleaned (controls, bidi, U+2028/9; 200
+  characters) and reaches `osascript` only as argv.
 - `gc` and `destroy` never destroy without an explicit y; `-y` is the only
   way past `destroy`'s prompt. `gc` offers only sessions min-zed prepared
   (`$STATE/sessions/NAME`), never another tool's.
@@ -59,8 +65,12 @@ the min-<client> repos (plan of record:
   process: a connect starts a stopped box. The watch polls only in-use boxes.
 - The watch notifies only on a change to `needs-input` or `finished`
   (cache `$STATE/cache/NAME.agent`); a stale state seen first is cached
-  silently. One watch per state dir (`watch.pid`), stopped by PID
-  (`watch --stop` checks the PID is a `min-zed watch`).
+  silently; at most one notification per box per minute. One watch per state
+  dir (`watch.lock` + `watch.pid`; a pid is ours only if `ps` shows a
+  `min-zed watch`; the loop leaves when the pid file is not its own), stopped
+  by PID. `watch --ensure` reports success only once the watch runs.
+  `watch.log` is trimmed like `proxy.log`.
+- `gc` calls the kernel's `gc_still_idle NAME` right before each question.
 - Server pre-fetch runs only from `open`/`new` on a fresh session, only with
   `MIN_ZED_PREFETCH=1`, fully detached in the box (`setsid nohup … &`, all
   streams `/dev/null`); never from `prepare` or `_proxy`.
@@ -76,15 +86,16 @@ the min-<client> repos (plan of record:
   what the first install created is in the shared
   `${XDG_STATE_HOME:-~/.local/state}/min-clients/ssh-config-created`, deleted
   (with what it lists, if empty) by whichever tool removes the last Include.
-- Tests reach tools only through stubs under `$T/bin` or nonexistent
-  absolute paths (`case_tests_use_absolute_tool_paths` checks): a bare name
-  resolves through the kernel's `/opt/homebrew/bin` PATH fallback to the real
-  `zed`.
+- Tests set `MIN_NO_PATH_EXTEND=1`, unset `ZDOTDIR VISUAL EDITOR`, put
+  tripwire stubs on PATH for `open osascript zed code cursor windsurf herdr
+  curl` (a call fails the case), and reach the real stubs only by absolute
+  `*_BIN` paths in `$T/stub-bin` (`case_tests_use_absolute_tool_paths`
+  checks). Never point a test at a bare program name.
 
 ## Kernel
 
 Do not edit the kernel block here: it is the frozen cmux block
-(`~/code/min-clients/cmux/bin/min-cmux` lines 25–698, "As built" in
+(`~/code/min-clients/cmux/bin/min-cmux` lines 25–759 at cmux `0e89793`, kernel v2, sha `724b7471…c1ba`, "As built" in
 `~/code/min-clients/KERNEL.md`), byte for byte. Changes go into the cmux
 repo first, then are copied into every repo, then `just kernel-sha`.
 `tests/run.sh` checks the pin and that the block mentions neither Zed nor

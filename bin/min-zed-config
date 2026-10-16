@@ -11,17 +11,22 @@ ours that already exists is kept as written (so a hand-added option such as
 
 settings.json is JSONC (comments, trailing commas). Like minx-config, this
 edits text, not a re-serialised object, so the user's comments and layout
-stay: it parses leniently to learn the structure, then rewrites only the
-`ssh_connections` array (or splices a new key in after the opening brace, or
-removes the key when it held only our entries). The file is written through
-(a dotfiles symlink stays a symlink), after a dated backup, and never when the
-effective settings would not change. `--remove` drops every entry of ours.
+stay: it parses leniently to learn the structure, then deletes our unwanted
+entries and appends missing ones inside the `ssh_connections` array, leaving
+every other byte (other entries, comments between them, CRLF line ends) as
+it was; or splices a new key in after the opening brace. The key is removed
+again only if we added it (`--record`), and a settings file we created is
+deleted by `--remove` once nothing is left in it. Writes go to a temp file
+beside the real file and replace it in one rename (a dotfiles symlink stays a
+symlink), after a dated backup, and never when the effective settings would
+not change.
 """
 import argparse
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 
 PREFIX = "min-zed."
@@ -30,7 +35,7 @@ KEY = "ssh_connections"
 KEEP_BACKUPS = 20
 
 
-def strip_jsonc(text):
+def strip_jsonc(text, trailing=True):
     """Return text with // and /* */ comments and trailing commas blanked.
 
     Every other byte keeps its offset (comments become spaces, newlines stay),
@@ -70,7 +75,7 @@ def strip_jsonc(text):
             out.append(blank(text[i:j]))
             i = j
             continue
-        if c == ",":
+        if c == "," and trailing:
             last_comma = len(out)
         elif c in "}]" and last_comma >= 0:
             out[last_comma] = " "
@@ -83,7 +88,7 @@ def strip_jsonc(text):
 
 
 def load_jsonc(text):
-    s = strip_jsonc(text)
+    s = strip_jsonc(text[1:] if text.startswith("\ufeff") else text)
     return (json.loads(s) if s.strip() else {}), s
 
 
@@ -168,55 +173,141 @@ def line_indent(text, pos):
     return m.group(0) if m else ""
 
 
-def plan(text, names):
-    """The new settings text for exactly these names (ours), or the text unchanged."""
+def line_bounds(text, st, en):
+    """Widen [st, en) to whole lines when nothing else is on them (keeps CRLF pairs whole)."""
+    ls = text.rfind("\n", 0, st) + 1
+    le = text.find("\n", en)
+    le = len(text) if le < 0 else le
+    if text[ls:st].strip() == "" and text[en:le].strip() == "":
+        return ls, (le + 1 if le < len(text) else le)
+    return st, en
+
+
+def apply_edits(text, edits):
+    """Apply (start, end, replacement) edits; deletions are merged when they overlap."""
+    dels = sorted((a, b) for a, b, r in edits if b > a)
+    merged = []
+    for a, b in dels:
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    ins = [(a, r) for a, b, r in edits if r]   # a replacement is a deletion plus an insertion
+    # From the end, so offsets stay valid; at one offset, delete before inserting.
+    ops = [(a, 0, b, "") for a, b in merged] + [(a, 1, a, r) for a, r in ins]
+    for a, kind, b, r in sorted(ops, key=lambda o: (-o[0], o[1])):
+        text = text[:a] + r + text[b:]
+    return text
+
+
+def edit_array(text, s, kstart, vstart, vend, want, eol):
+    """Edit the ssh_connections array in place: drop our unwanted entries, append
+    missing ones after the last remaining entry. Every other byte (foreign
+    entries, comments between them) stays. Returns (text, entries_left)."""
+    els = elements(s, vstart, vend)
+    c = strip_jsonc(text, trailing=False)   # comments blanked, every comma kept
+    info = []
+    for idx, (a, b) in enumerate(els):
+        nxt = els[idx + 1][0] if idx + 1 < len(els) else vend - 1
+        j = ws(c, b)
+        info.append((a, b, json.loads(s[a:b]), j if j < nxt and c[j] == "," else None))
+    kept, removes = set(), []
+    for idx, (a, b, val, ca) in enumerate(info):
+        if ours(val):
+            n = val["host"][len(PREFIX):]
+            if n in want and n not in kept:
+                kept.add(n)
+                continue
+            removes.append(idx)
+    adds = [n for n in want if n not in kept]
+    remaining = [i for i in range(len(info)) if i not in removes]
+    if not removes and not adds:
+        return text, len(info)
+    edits = []
+    for idx in removes:
+        a, b, _, ca = info[idx]
+        if ca is not None:
+            st, en = a, ca + 1
+        else:
+            prev_end = info[idx - 1][1] if idx > 0 else vstart + 1
+            pos = c.rfind(",", prev_end, a)
+            st, en = (pos, b) if pos >= 0 else (a, b)
+        edits.append((*line_bounds(text, st, en), ""))
+    kind = line_indent(text, kstart) + "  "
+    if adds and remaining:
+        a, b, _, ca = info[remaining[-1]]
+        ls = text.rfind("\n", 0, a) + 1
+        ind = text[ls:a] if text[ls:a].strip() == "" else kind
+        le = text.find("\n", ca) if ca is not None else -1
+        if remaining[-1] == len(info) - 1 and le >= 0 and c[ca + 1:le].strip() == "":
+            # trailing-comma style: new lines after that line (its comment stays put)
+            at = le - 1 if text[le - 1] == "\r" else le
+            edits.append((at, at, "".join(f"{eol}{ind}{render(n)}," for n in adds)))
+        else:
+            edits.append((b, b, "".join(f",{eol}{ind}{render(n)}" for n in adds)))
+    elif adds and s[vstart + 1:vend - 1].strip() == "":
+        body = ("," + eol).join(f"{kind}{render(n)}" for n in adds)
+        edits.append((vstart, vend, f"[{eol}{body}{eol}{kind[:-2]}]"))
+    elif adds:
+        edits.append((vstart + 1, vstart + 1, "".join(f"{eol}{kind}{render(n)}" + ("," if k < len(adds) - 1 else "")
+                                                      for k, n in enumerate(adds))))
+    out = apply_edits(text, edits)
+    if not remaining and not adds:
+        # nothing left: an array that is now only whitespace goes back to []
+        s2 = strip_jsonc(out)
+        _, _, v2s, v2e = [m for m in top_members(s2)[0] if m[0] == KEY][-1]
+        if s2[v2s + 1:v2e - 1].strip() == "" and out[v2s + 1:v2e - 1].strip() == "":
+            out = out[:v2s] + "[]" + out[v2e:]
+    return out, len(remaining) + len(adds)
+
+
+def plan(text, names, we_added_key=False):
+    """(new text, key_added, key_removed) for exactly these names (ours).
+
+    The key is removed only when it ends up empty and we added it (a user's own
+    empty list stays)."""
+    if text.startswith("\ufeff"):  # a BOM stays, outside everything we parse
+        new, added, removed = plan(text[1:], names, we_added_key)
+        return "\ufeff" + new, added, removed
+    eol = "\r\n" if "\r\n" in text else "\n"
     if not text.strip():
-        text = "{\n}\n"
+        text = "{" + eol + "}" + eol
     s = strip_jsonc(text)
     members, brace = top_members(s)
     found = [m for m in members if m[0] == KEY]
     want = sorted(set(names))
     if not found:
         if not want:
-            return text
+            return text, False, False
         ind = "  "
-        body = ",\n".join(f"{ind}  {render(n)}" for n in want)
+        body = ("," + eol).join(f"{ind}  {render(n)}" for n in want)
         sep = "," if members else ""
-        return f"{text[:brace + 1]}\n{ind}\"{KEY}\": [\n{body}\n{ind}]{sep}{text[brace + 1:]}"
+        return f"{text[:brace + 1]}{eol}{ind}\"{KEY}\": [{eol}{body}{eol}{ind}]{sep}{text[brace + 1:]}", True, False
     key, kstart, vstart, vend = found[-1]
     if s[vstart] != "[":
         raise ValueError(f"{KEY} is not a list; fix it by hand")
-    foreign, mine = [], {}
-    for a, b in elements(s, vstart, vend):
-        val = json.loads(s[a:b])
-        if ours(val):
-            mine.setdefault(val["host"][len(PREFIX):], text[a:b])
-        else:
-            foreign.append(text[a:b])
-    items = foreign + [mine.get(n, render(n)) for n in want]
-    if not items and mine:
-        # Only ours were there: drop the key, with its comma and its line.
-        a, b = kstart, vend
-        nb = ws(s, b)
-        if nb < len(s) and s[nb] == ",":
-            b = nb + 1
-        else:
-            pa = a - 1
-            while pa > brace and s[pa].isspace():
-                pa -= 1
-            if s[pa] == ",":
-                a = pa
-        while a > 0 and text[a - 1] in " \t":
-            a -= 1
-        if a > 0 and text[a - 1] == "\n" and a - 1 > brace:
-            a -= 1
-        return text[:a] + text[b:]
-    ind = line_indent(text, kstart)
-    if not items:
-        new = "[]"
+    had_ours = any(ours(json.loads(s[a:b])) for a, b in elements(s, vstart, vend))
+    new, left = edit_array(text, s, kstart, vstart, vend, want, eol)
+    if left or not (had_ours and we_added_key):
+        return new, False, False
+    # Only ours were there and we made the key: drop it, with its comma and its line.
+    a, b = kstart, vend
+    nb = ws(s, b)
+    if nb < len(s) and s[nb] == ",":
+        b = nb + 1
     else:
-        new = "[\n" + ",\n".join(f"{ind}  {it}" for it in items) + f"\n{ind}]"
-    return text[:vstart] + new + text[vend:]
+        pa = a - 1
+        while pa > brace and s[pa].isspace():
+            pa -= 1
+        if s[pa] == ",":
+            a = pa
+    while a > 0 and text[a - 1] in " \t":
+        a -= 1
+    if a > 0 and text[a - 1] == "\n" and a - 1 > brace:
+        a -= 1
+        if a > 0 and text[a - 1] == "\r" and a - 1 > brace:
+            a -= 1
+    return text[:a] + text[b:], False, True
 
 
 def our_hosts(cfg):
@@ -245,7 +336,7 @@ def doctor(path, names):
     if not os.path.exists(path):
         return row("warn", f"{path} missing; no saved connections", "min-zed zed-config")
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", newline="") as f:
             cfg, _ = load_jsonc(f.read())
     except ValueError as e:
         return row("FAIL", f"{path} is not valid JSONC ({e})", "fix the syntax; Zed ignores a broken settings file")
@@ -258,11 +349,49 @@ def doctor(path, names):
             "min-zed zed-config")
 
 
+def load_record(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            r = json.load(f)
+        return r if isinstance(r, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_record(path, rec):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".zed-config.", dir=os.path.dirname(path) or ".")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    os.replace(tmp, path)
+
+
+def write_atomic(path, text, exists):
+    """Replace the file Zed reads in one rename: a temp file beside the real
+    file (a dotfiles symlink stays a symlink to it), mode kept."""
+    real = os.path.realpath(path)
+    d = os.path.dirname(real) or "."
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".settings.json.", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, os.stat(real).st_mode & 0o7777 if exists else 0o644)
+        os.replace(tmp, real)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("names", nargs="*", help="live session names")
     ap.add_argument("--settings", default=os.environ.get("MIN_ZED_SETTINGS") or os.path.expanduser("~/.config/zed/settings.json"))
     ap.add_argument("--backup-dir", default=None, help="where dated backups go (default: next to the settings)")
+    ap.add_argument("--record", default=None, help="JSON file remembering what we created (the file, the key)")
     ap.add_argument("--remove", action="store_true", help="drop every min-zed.* entry")
     ap.add_argument("--dry-run", action="store_true", help="print the resulting file; write nothing")
     ap.add_argument("--doctor", action="store_true", help="report for `min-zed doctor`; write nothing")
@@ -276,34 +405,45 @@ def main():
 
     path = a.settings
     exists = os.path.exists(path)
+    rec = load_record(a.record) if a.record else {}
     text = ""
     if exists:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8", newline="") as f:
             text = f.read()
     try:
         current, _ = load_jsonc(text)
-        target = plan(text, [] if a.remove else a.names)
+        target, added, removed = plan(text, [] if a.remove else a.names, bool(rec.get("added_key")))
         result, _ = load_jsonc(target)
     except (ValueError, IndexError) as e:
         sys.exit(f"min-zed-config: {path}: cannot edit ({e}); edit ssh_connections by hand")
 
+    # We made the file and it is back to nothing of anyone's: remove it.
+    delete = a.remove and exists and rec.get("created_file") and result == {}
     if a.dry_run:
-        sys.stdout.write(target)
+        sys.stdout.write("" if delete else target)
         return
-    if result == current:
+    if result == current and not delete:
         if not a.quiet:
             print(f"{path}: min-zed connections already up to date")
         return
 
     bdir = a.backup_dir or os.path.dirname(path) or "."
     saved = backup(path, bdir) if exists else None
-    if not exists:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    # Write through: a symlinked settings.json stays a symlink, mode kept.
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(target)
-    print(f"min-zed-config: {path}: min-zed connections now {', '.join(our_hosts(result)) or 'none'}"
-          + (f" (previous version: {saved})" if saved else ""), file=sys.stderr)
+    if delete:
+        os.unlink(path)
+        rec = {}
+    else:
+        write_atomic(path, target, exists)
+        if not exists:
+            rec["created_file"] = True
+        if added:
+            rec["added_key"] = True
+        if removed:
+            rec["added_key"] = False
+    if a.record:
+        save_record(a.record, rec)
+    what = "removed (min-zed created it)" if delete else f"min-zed connections now {', '.join(our_hosts(result)) or 'none'}"
+    print(f"min-zed-config: {path}: {what}" + (f" (previous version: {saved})" if saved else ""), file=sys.stderr)
 
 
 if __name__ == "__main__":
