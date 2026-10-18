@@ -1880,8 +1880,18 @@ JSON
 
 # ==== runner ======================================================================
 
+# A fresh install (no session has a key dir yet): gc finds nothing to offer
+# and exits 0. own_filter's loop must not fail when its glob matches nothing.
+case_gc_no_own_sessions_yet() {
+    own_sessions
+    rm -rf "$STATE/sessions"
+    run gc --dry-run
+    assert_rc 0
+    ! grep -q "min ls failed" "$T/err" || fail "gc died: $(cat "$T/err")"
+}
+
 CASES="
-sshconfig_install_creates_include_and_stanza sshconfig_install_is_idempotent
+gc_no_own_sessions_yet sshconfig_install_creates_include_and_stanza sshconfig_install_is_idempotent
 sshconfig_install_prepends_to_existing_config sshconfig_install_keeps_symlinked_config
 sshconfig_remove_restores_original sshconfig_remove_keeps_other_tools_include sshconfig_print_touches_nothing
 sshconfig_destroy_drops_stanza sshconfig_stale_state_dir_is_skipped sshconfig_real_ssh_resolves

@@ -81,6 +81,14 @@ pct() { printf '%s' "$1" | sed 's/%/%%/g'; }
 
 mn() { "$MIN" "$@"; }
 min_ls() { mn ls --json </dev/null; }
+# own_filter: min ls --json on stdin, narrowed to the sessions this tool has
+# prepared (a key dir under $STATE/sessions). gc and orphan reminders use only
+# these: other tools' boxes are theirs to tidy. own_ls: the same from min ls.
+own_filter() {
+    ol_mine=$(for s in "$STATE"/sessions/*/; do if [ -d "$s" ]; then basename "$s"; fi; done)
+    jq --arg m "$ol_mine" '($m | split("\n")) as $k | .sessions |= map(select(.name as $n | $k | index([$n])))'
+}
+own_ls() { ol_j=$(min_ls) || return 1; printf '%s' "$ol_j" | own_filter; }
 # sess_field NAME FIELD  (id | project_path | status | branch)
 sess_field() {
     min_ls | jq -r --arg n "$1" --arg f "$2" '
@@ -799,13 +807,6 @@ src_dir() {
         sl=$(readlink "$sd"); case $sl in /*) sd=$sl ;; *) sd=$(dirname "$sd")/$sl ;; esac
     done
     dirname "$sd"
-}
-
-# own_ls: min ls --json narrowed to the sessions this tool has prepared (a
-# key dir under $STATE/sessions). Other tools' boxes are theirs to tidy.
-own_ls() {
-    ol_mine=$(for s in "$STATE"/sessions/*/; do [ -d "$s" ] && basename "$s"; done)
-    min_ls | jq --arg m "$ol_mine" '($m | split("\n")) as $k | .sessions |= map(select(.name as $n | $k | index([$n])))'
 }
 
 # ---- Zed settings (ssh_connections) -------------------------------------------
