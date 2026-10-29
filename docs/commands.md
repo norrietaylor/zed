@@ -1,43 +1,44 @@
 # Commands
 
-| Command | What it does |
+Run `min-zed` on the host: any Mac terminal, a Minimal task in a local Zed
+window, or a terminal opened with `` ctrl-alt-` ``. Shells inside a box run
+in the box, where `min-zed` is not installed.
+
+| Command | Does |
 |---|---|
-| `open [PATH] [-n NAME]` | Reuse PATH's live min-zed session (or NAME's), else activate one with `--loadout zed`; prepare it; open `ssh://min-zed.NAME/workbench` in Zed. Prints `min-zed.NAME`. |
-| `new [PATH] [-n NAME]` | Always activate a fresh session for PATH (default `.`), then as `open`. NAME must be free. |
-| `attach [NAME]` | Open an existing session in Zed; no NAME: a numbered picker (terminal only). |
-| `destroy [-y] [NAME]` | `min session destroy` after `[y/N]` (`-y` skips it). No NAME: the one session whose project is this directory. Drops its stanza, keys and Zed entry. |
-| `gc [--older-than SECONDS] [--dry-run]` | min-zed sessions with no live ssh client of any tool, oldest first, each with `[y/N/q]`. |
-| `status` | Every min session: status, project, made by min-zed, in use, last agent state, time unused. |
-| `doctor` | Health report; exits 1 on any FAIL. |
-| `watch [--ensure\|--stop]` | Agent-state notification loop (foreground); `--ensure` starts it in the background if needed, `--stop` stops it by its PID file. |
-| `ssh NAME [-- ARGS...]` | Plain ssh over the same transport (`-- -v true` to debug). |
-| `ssh-config [--remove\|--print]` | Install/remove the `~/.ssh/min-zed.conf` Include; `--print` writes nothing. |
-| `zed-config [--remove\|--print]` | Opt in to/out of Zed `ssh_connections` sync; `--print` writes nothing. |
-| `completions zsh\|bash` | Completion script: `eval "$(min-zed completions zsh)"`. |
-| `_proxy NAME` | Hidden: the stanzas' ProxyCommand. Never run it by hand. |
+| `min-zed open [PATH] [-n NAME] [--no-window]` | the session for `PATH` (default `.`): a live one of min-zed's is reused, else one is activated with `--loadout zed`; then Zed opens `/workbench` in it. Prints `min-zed.NAME` |
+| `min-zed new [PATH \| --empty] [-n NAME] [--no-window]` | always a new session for `PATH`, then Zed; `--empty`: an empty `/workbench` (`--sync none`), named by min (`box-<hex>`) |
+| `min-zed attach [NAME] [--no-window]` | an existing session in Zed (no NAME: pick one of min-zed's) |
+| `min-zed destroy [-y] [--if-idle] [--force] [NAME]` | ask `[y/N]`, then destroy. No NAME: min-zed's one session for the current directory; otherwise, on a terminal, pick one. `--if-idle` refuses with exit 3 while something is connected. Without a terminal, min refuses a session with unsaved changes: exit 4; `-y --force` discards them |
+| `min-zed gc [--older-than SECONDS] [--dry-run]` | list active sessions no ssh client is using (oldest first), then ask `[y/N/q]` for each |
+| `min-zed status [--json]` | table: session, status, project, in use, idle age; `--json`: `[{name, status, project, own, empty, in_use, idle}]` (idle in seconds or null) |
+| `min-zed doctor` | health report; exits 1 on any FAIL |
+| `min-zed setup [--remove]` | the whole install from this checkout: links `~/.local/bin/min-zed` and the `zed` loadout here, copies Minimal's skills, then `ssh-config` and `config`; `--remove` undoes only ours |
+| `min-zed config [--remove\|--print]` | opt in to (or out of) the Zed wiring: `ssh_connections` in `settings.json`, the Minimal tasks in `tasks.json`, the local-terminal key in `keymap.json`; `--print` only prints. Also `min-zed zed-config` |
+| `min-zed ssh NAME [-- ARGS]` | plain `ssh` over the same transport (debugging: `-- -v`) |
+| `min-zed ssh-config [--remove\|--print]` | opt in: one `Host min-zed.NAME` stanza per session in `~/.ssh/min-zed.conf`, included from the top of `~/.ssh/config` |
+| `min-zed completions <zsh\|bash>` | print a completion script (`eval "$(min-zed completions zsh)"`) |
 
-## Names
+`--no-window` does everything but open the window.
 
-`<dir>-<word>`: the project directory's name lowercased, every run of other
-characters turned into `-`, then the first of `amber basil coral … zinc`
-(then `amber2 …`) no live session uses. `-n NAME` must match
-`^[a-z0-9][a-z0-9-]*$`: names are ssh host names and `Host` patterns.
+Names: without `-n`, min names a new session (`<dir>-<hex>`, e.g.
+`myproject-3f9c`), and min-zed takes the one new session for the path.
+Every name, min's or a `-n NAME`, must match `^[a-z0-9][a-z0-9-]*$`: names
+become hostnames and ssh `Host` patterns; one that does not is refused.
 
-## `open` versus `new`
+"In use" means some process on the host is connected to the box: any
+`min session exec NAME ... sshd`, which covers Zed, a terminal `ssh`, `scp`
+and any other ssh client, including other min-<client> tools. `gc` leaves
+sessions in use out; their idle age (`status`, `gc`) restarts while they are
+in use, and counts from the first `gc` or `status` that saw the session
+unused (each run dates them).
 
-`open` reuses only a session min-zed prepared (it has keys under
-`~/.local/state/min-zed/sessions/NAME`); a session for the same directory
-made by another tool is left to that tool, and `open` makes its own.
-`open -n NAME` for a session whose project is another directory fails rather
-than opening the wrong code.
+Own sessions: min-zed chooses only among sessions it has connected to (it
+has keys for them under `STATE/sessions/NAME`): `gc`, `open`'s reuse,
+`destroy`'s current-directory lookup and picker, the `attach` picker and
+completions. Boxes other tools or `min` alone made are not its to tidy; only
+an explicit NAME (`attach NAME`, `destroy NAME`, `open -n NAME`) reaches
+them.
 
-## just recipes
-
-| Recipe | |
-|---|---|
-| `just check` | shellcheck, py_compile, `tests/run.sh` (includes the kernel hash pin and a long-prefix pass) |
-| `just install` | link `~/.local/bin/min-zed`, then `loadout`, `ssh-config`, `zed-config` |
-| `just loadout` | symlink `loadouts/zed.toml` as Minimal loadout `zed`; refuses to replace a `zed.toml` that is not this repo's |
-| `just ssh-config` / `just zed-config` | the two opt-ins |
-| `just uninstall` | `ssh-config --remove`, `zed-config --remove`, `watch --stop`, remove the two symlinks if they point here |
-| `just kernel-sha` | re-pin `tests/kernel.sha` after syncing the kernel block |
+just recipes: `check`, `install`, `ssh-config`, `zed-config`, `skills`,
+`uninstall`.

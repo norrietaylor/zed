@@ -1,40 +1,37 @@
-# Security
+# What never leaves the host
 
-What never leaves the host:
-
-- **Private keys.** Each session has its own ed25519 key in
-  `~/.local/state/min-zed/sessions/NAME/` (dir 700, key 600). Only the public
-  key is pushed into the box, to `~/.ssh/min-zed/authorized_keys`.
-- **Your ssh agent and X11.** Every client path turns forwarding off itself
-  (`ForwardAgent no`, `ForwardX11 no`, `ForwardX11Trusted no`,
-  `AddKeysToAgent no`, `IdentitiesOnly yes`), and the box's sshd runs with
-  `AllowAgentForwarding=no` and `X11Forwarding=no`. A `Host *` with
-  `ForwardAgent yes` later in your config does not override it: the Include
-  comes first.
-- **Your other ssh identities.** `IdentitiesOnly yes` offers only the
-  session's key.
-
-Trust:
-
-- **Host keys are pinned.** `StrictHostKeyChecking yes` against a per-session
-  `known_hosts` that `prepare` writes from the key the box reports over
-  `min session exec` (min's own authenticated channel). Never `accept-new`.
-- **The box is untrusted.** The user name, home, sshd path and host key it
-  reports are checked against strict patterns before anything is written,
-  and the stored ones again when read; error messages strip control bytes.
-  The agent-state line is validated the same way before it reaches a
-  notification, and is passed to `osascript` as data.
-- **Nothing listens.** No port is opened on the host or in the box; the only
-  channel is `min session exec`.
-- **Opt-in edits.** Nothing under `~/.ssh` is touched until
-  `min-zed ssh-config`; Zed's settings not until `min-zed zed-config`. Both
-  back up before writing and leave every byte outside their own lines/entries
-  as it was, comments between Zed's `ssh_connections` entries included
-  (`--remove` restores `~/.ssh/config` byte for byte, and Zed's settings too
-  when min-zed's additions were the only change).
-- **Explicit destroy.** `destroy` and `gc` never destroy without a typed `y`
-  (`destroy -y` is the only way past it).
-
-The server pre-fetch, when enabled, downloads Zed's remote server inside the
-box over HTTPS from GitHub releases with `curl -f`; it verifies nothing
-beyond TLS, as Zed's own installer does. It is off by default.
+- **Only the public key enters the box.** Each session gets its own ed25519
+  key under `~/.local/state/min-zed/sessions/NAME`, and the box gets it in
+  `~/.ssh/min-zed/authorized_keys`.
+- **`~/.ssh/config` is yours.** Nothing under `~/.ssh` is touched until
+  `min-zed ssh-config` runs. That adds two marked lines at the top of
+  `~/.ssh/config` and keeps the stanzas in `~/.ssh/min-zed.conf`;
+  `--remove` restores `~/.ssh/config` byte for byte. A dated backup is taken
+  before every write.
+- **Zed's files are yours.** Nothing in `~/.config/zed` is touched until
+  `min-zed config` runs; then only the `min-zed.*` entries of
+  `ssh_connections` (and the key, if you had none) and the marked blocks in
+  `tasks.json` and `keymap.json` change, with a backup first. A file that
+  does not parse is refused, not repaired.
+- **Tasks run one fixed program.** Each Minimal task runs
+  `$HOME/.local/bin/min-zed` with fixed arguments. None puts a `$ZED_*`
+  variable in its command (Zed pastes those in unquoted), so a folder or
+  file name never becomes part of a shell command.
+- **What the box reports is checked.** The user name, home, sshd path and
+  host key a box prints are validated before any of them reaches
+  `known_hosts`, a stanza or an ssh option.
+- **The box's host key is pinned** (`StrictHostKeyChecking=yes`, never
+  `accept-new`), and re-pinned by `_proxy` on every connect, so only the box
+  min itself reaches can present it.
+- **Destroy always asks `[y/N]`**, default No; `-y` is the only way past it.
+  `gc` asks for each session.
+- **No agent or X11 forwarding.** Each stanza sets `ForwardAgent no`,
+  `ForwardX11 no`, `ForwardX11Trusted no` before any `Host *` of yours can
+  turn them on, and the box's sshd runs with `AllowAgentForwarding=no` and
+  `X11Forwarding=no`. An explicit `ssh -A min-zed.NAME` still wins on the
+  client; then only the box's sshd refuses it (defence in depth, not a
+  boundary). Port forwards work.
+- **Agent logins stay in the box.** Claude Agent in a box window signs in
+  inside the box; that login is destroyed with the box.
+- **Boxes are never woken to be asked.** `gc` and `status` read the host's
+  process table to tell what is in use; no box is contacted to find out.

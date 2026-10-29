@@ -1,96 +1,228 @@
 # Zed guide
 
-## Getting started
+min-zed turns a Minimal session into an ssh host named `min-zed.NAME` and
+opens Zed on `/workbench` in it as a remote project. Everything Zed does
+after that (installing its server in the box, language servers, terminals,
+tasks, agents) is Zed's own ssh remoting.
 
-1. `just install` (once). It links `min-zed`, installs the `zed` loadout,
-   writes `~/.ssh/min-zed.conf` with its Include, and opts in to Zed settings
-   sync.
-2. `min-zed open PATH` (default `.`): reuses a live min-zed session for PATH,
-   else activates one (`min session activate --loadout zed`), prepares it,
-   and runs `zed ssh://min-zed.NAME/workbench`.
-3. Zed connects over ssh, installs its remote server into `/home/.zed_server`
-   (first time per Zed version) and opens `/workbench`, the session's copy of
-   your project.
+There is no Zed extension: Zed's extension API has no UI. `min-zed setup`
+(through `min-zed config`) wires three of Zed's own surfaces instead: the
+Remote Projects list, the Minimal tasks and one key.
 
-`min-zed new PATH` always makes a fresh session (next free `<dir>-<word>`),
-for a second, independent box on the same project. `min-zed attach NAME`
-reopens an existing one.
+## Requirements
 
-## Reaching a session from Zed directly
+- Zed (tested with 1.26.2; `min-zed doctor` notes any other version). The
+  `zed` command (**Zed → Install CLI**) is optional: without it min-zed uses
+  `/Applications/Zed.app/Contents/MacOS/cli`.
+- `min-zed ssh-config` installed (`just install` does it): Zed runs
+  `/usr/bin/ssh`, which reads `~/.ssh/config`, which then includes
+  `~/.ssh/min-zed.conf`.
+- The box needs outbound HTTPS once per Zed version, to download Zed's
+  server (below).
 
-Every live session has a stanza, so any of these work once `open` has run
-for it at least once:
+`min-zed doctor` checks each of these.
 
-- Zed's **Open Remote** (`⌃⌘O`): with settings sync on, each session is
-  listed by its name (the entry's `nickname`) under host `min-zed.NAME`.
-- `zed ssh://min-zed.NAME/workbench` from any terminal.
-- `ssh min-zed.NAME` in a terminal, for a plain shell.
+## Opening a session
 
-Each connect goes through `min-zed _proxy NAME`, which re-pins the session's
-host key and re-pushes its public key before starting sshd, so a session that
-was destroyed and recreated under the same name just works.
+| Command | Session | Window |
+|---|---|---|
+| `min-zed open [PATH]` | the live min-zed session for PATH if there is one, else a new one | yes |
+| `min-zed open PATH -n NAME` | NAME if it exists (for PATH), else a new one named NAME | yes |
+| `min-zed new [PATH]` | always a new one | yes |
+| `min-zed new --empty` | a new one with an empty `/workbench` | yes |
+| `min-zed attach [NAME]` | an existing one (no NAME: a numbered picker) | yes |
 
-## Settings sync (`ssh_connections`)
+`--no-window` on any of them skips the window.
 
-`min-zed zed-config` (run by `just install`) makes the `ssh_connections`
-entries whose `host` starts with `min-zed.` in `~/.config/zed/settings.json`
-exactly the live min-zed sessions; `open`, `attach`, `ssh`, `destroy` and `gc`
-keep it that way afterwards. A new entry is
+New sessions are activated with your `default_loadouts` plus
+`--loadout zed`. Each command prepares the box (pins its host key, pushes the
+public key, refreshes the stanza), refreshes the `ssh_connections` entries,
+then runs:
 
-```json
-{"host": "min-zed.NAME", "nickname": "NAME", "projects": [{"paths": ["/workbench"]}]}
+    zed ssh://min-zed.NAME/workbench
+
+The command prints `min-zed.NAME`, so `ssh "$(min-zed open)"` works too.
+
+Remote Projects, Open Recent and `zed ssh://min-zed.NAME/workbench` from
+any terminal reconnect the same way: every connection goes through
+`min-zed _proxy NAME`, which prepares the box again first, so a session
+recreated under the same name heals itself.
+
+## Zed and a box
+
+- **The server.** Zed downloads its remote server into the box itself, into
+  `/home/.zed_server/zed-remote-server-stable-<version>+stable.<build>.<sha>`,
+  which persists with the session (seen with Zed 1.26.2, 2026-10-29). A box
+  without outbound HTTPS can take it from the Mac instead: add
+  `"upload_binary_over_ssh": true` to the box's `ssh_connections` entry;
+  min-zed keeps an entry of yours as you wrote it.
+- **Restricted Mode.** Zed opens a host it has not seen in Restricted Mode.
+  Trust a new box once; it stays trusted.
+- **Tasks run where the window is.** Global tasks run on the Mac in a local
+  window, and in the box (bash, in `/workbench`) in a box window. The
+  Minimal tasks therefore work from local windows; in a box window they
+  print where to run them instead (below).
+- **A terminal on the Mac.** A box window's terminals are in the box.
+  `` ctrl-alt-` `` opens a terminal on your Mac from any window
+  (`workspace::NewTerminal` with `"local": true`), where `min-zed` works.
+  It sits beside Zed's `` ctrl-` `` (terminal panel) and `ctrl-~` (new
+  terminal).
+- **Recent projects.** Zed remembers boxes you opened. min-zed cannot edit
+  that list: once a box is destroyed, remove it in Zed (Open Recent, then
+  remove the entry). Remote Projects, which min-zed keeps, lists only live
+  boxes.
+- **Agent forwarding** stays off: the stanza says `ForwardAgent no` and the
+  box's sshd refuses it anyway.
+- **Several editors at once.** VS Code, Cursor and Zed have been connected
+  to one box at the same time (2026-10-02); each min-<client> tool keeps its
+  own key and host alias.
+
+## The Minimal tasks
+
+`min-zed config` puts seven tasks in Zed's global `~/.config/zed/tasks.json`.
+Run them with **task: spawn** (`cmd-shift-r`) and type "Minimal":
+
+| Task | Runs | Notes |
+|---|---|---|
+| Minimal: New Box from Folder | `min-zed new .` in the open folder | offered only with a folder open |
+| Minimal: New Empty Box | `min-zed new --empty` | |
+| Minimal: Open Box… | `min-zed attach` | numbered picker |
+| Minimal: Destroy Box… | `min-zed destroy` | the folder's box, else a picker; asks `[y/N]` |
+| Minimal: Clean Up Idle Boxes… | `min-zed gc` | asks `[y/N/q]` per box |
+| Minimal: Status | `min-zed status` | |
+| Minimal: Doctor | `min-zed doctor` | |
+
+Each opens in a task terminal, where the CLI's own pickers and `[y/N]`
+questions are the UI: type the number or the answer there. The three that
+open a window hide their terminal once they succeed; the others leave it to
+be read. Every task runs `$HOME/.local/bin/min-zed` through `sh`, whatever
+your login shell. Where that file is missing (a box window, or before
+`setup`) it prints:
+
+    min-zed: /home/.local/bin/min-zed not found. In a box window, run Minimal tasks from a local window or a Mac terminal (ctrl-alt-`); on the Mac, run min-zed setup.
+
+## Zed's files (`min-zed config`)
+
+All three files are in `~/.config/zed` (or `MIN_ZED_SETTINGS`,
+`MIN_ZED_TASKS`, `MIN_ZED_KEYMAP`). They are JSONC that you and Zed edit, so
+min-zed never rewrites one from a parsed object: every edit is textual.
+
+**settings.json: Remote Projects.** One `ssh_connections` entry per live
+min-zed session; Zed reloads the list live:
+
+```jsonc
+"ssh_connections": [
+  { "host": "min-zed.myproject-3f9c", "nickname": "myproject-3f9c", "projects": [{ "paths": ["/workbench"] }] }
+]
 ```
 
-and an entry you already have for a live session is kept exactly as you wrote
-it, so options such as `"upload_binary_over_ssh": true` (for a box without
-outbound HTTPS) survive. Every other entry, setting and comment is left
-alone, including comments between entries in `ssh_connections`: our entries
-are deleted and appended in place, and a CRLF file or a BOM stays as it was.
-Each write is preceded by a backup in `~/.local/state/min-zed/backups/` (the
-newest 20 are kept), replaces the file in one rename, and is skipped when
-nothing would change. `min-zed zed-config --print` shows the result without
-writing; `--remove` takes every `min-zed.*` entry out, the
-`ssh_connections` key too if min-zed added it (a list you had stays, even
-empty), and the whole file if min-zed created it and nothing else is in it
-(`~/.local/state/min-zed/zed-config.json` remembers which).
+- Entries are added by `open`, `attach` and `ssh`, and dropped by
+  `destroy`, `gc` and any later refresh once min no longer lists the
+  session.
+- Only entries whose host starts with `min-zed.` are added or removed. An
+  entry of ours that already exists is kept exactly as written (so
+  `"upload_binary_over_ssh": true` survives); every other entry, setting and
+  comment, CRLF line endings and a BOM stay.
+- If you have no `ssh_connections`, min-zed adds the key, and `--remove`
+  takes it out again only then.
+- When `min ls` fails, the existing `min-zed.*` entries are left as they are
+  (a partial list would prune live ones), and doctor says it could not check
+  them.
 
-Settings sync is optional: `zed ssh://` reads `~/.ssh/config`, so Zed reaches
-a session without any entry.
+**tasks.json and keymap.json: marked blocks.** Each gets a block right
+after the array's opening `[`:
 
-## Claude Code notifications (unverified end to end: spike E1)
+```jsonc
+[
+  // min-zed:begin (managed by `min-zed config`; `min-zed config --remove` removes it; edits inside are replaced)
+  { "label": "Minimal: New Box from Folder", ... },
+  // min-zed:end
+  ...your tasks...
+]
+```
 
-The `zed` loadout registers a Claude Code hook in the box
-(`~/.claude/min-zed-hook.sh`) that writes Claude's state to
-`/home/.min-zed/agent-state` as one line, `state epoch message`
-(`started`, `working`, `needs-input`, `finished`, `idle`, `clear`).
+The block is min-zed's and is rewritten whole; everything outside it is
+yours (Zed's keymap editor adds new bindings after it). A file with no array
+gets one, marked `// min-zed:array`, and `--remove` takes that array out
+again while nothing else went into it. Only `min-zed config` (and `setup`)
+writes these two blocks; the refreshes from `open`, `destroy` and the rest
+touch only `ssh_connections`.
 
-`min-zed watch` (started in the background by `open`/`attach`/`new`) wakes
-every 5 s, looks at the host's process list for sessions that have a live
-sshd connection, and for those only runs
-`min session exec NAME cat /home/.min-zed/agent-state`. When the state has
-changed to `needs-input` or `finished` it posts a macOS notification titled
-`min-zed`, subtitle `NAME: needs input` / `NAME: finished`, at most one per
-box per minute. A box with no connection is never asked (asking would start
-a stopped box). Each read is capped at 512 bytes (in the box and again on the
-host) and killed after `MIN_ZED_EXEC_TIMEOUT` seconds (10); the message loses
-control characters, bidi overrides and line separators and is cut at 200
-characters. One watch runs per state dir (`watch.lock`, `watch.pid`);
-`watch.log` is trimmed to its newest 500 lines past 1000.
+For all three:
 
-`min-zed watch --stop` stops it; `min-zed status` shows the last state seen.
+- Before each write the old file is copied to
+  `~/.local/state/min-zed/backups/<file>.<time>`. A symlinked file is
+  written through, and replaced in one rename.
+- A file whose content would not change is not written.
+- A file that does not parse (or whose top level is the wrong kind) is
+  refused, and then none of the three is written.
+- `min-zed config --print` shows the results without writing;
+  `min-zed config --remove` takes everything out, restoring the bytes it
+  found, and deletes a file min-zed created once it is empty again.
 
-## Server pre-fetch (unverified: spike Z1, off by default)
+## Agents
 
-With `MIN_ZED_PREFETCH=1`, `open` and `new` (on a fresh session only) read
-the host Zed's version and start a fully detached download of the matching
-remote server inside the box, into `/home/.zed_server/zed-remote-server-stable-VERSION`,
-so Zed may find it already there. The file name, URL and packaging follow
-Zed's installer as read, not as observed; until spike Z1 confirms them Zed's
-own installer does the job (it took a few seconds in the 2026-10-02 test).
+- **Claude Agent and other ACP agents** in a box window run inside the box.
+  Zed installs its own Node for them there (`~/.local/share/zed/node`; the
+  loadout needs none). Sign in once per box: the login lives in the box and
+  goes with it when the box is destroyed.
+- **Zed's own agent** runs in Zed on the Mac and works on the box's files
+  through the remote project.
+- **Notifications.** Zed's agent notifications cover threads in box windows
+  too (seen 2026-10-29). Worth setting in your Zed settings:
 
-## Boxes made by other tools
+  ```jsonc
+  "agent": {
+    "notify_when_agent_waiting": "all_screens",
+    "play_sound_when_agent_done": true
+  }
+  ```
 
-A session min-zed did not create (by `min` directly, or another min-<client>
-tool) has no `zed` loadout: `min-zed attach NAME` still connects (openssh is
-in every min-<client> loadout), but the Claude hook is absent, so no
-notifications. min-zed's `gc` never offers another tool's session.
+- **Claude Code in a Zed terminal** (in the box) can trigger the same Zed
+  notification by ringing the terminal bell: set Claude's
+  `preferredNotifChannel` to `"terminal_bell"` in the box (from Zed's docs;
+  not tested with min-zed).
+
+**Skills.** `min-zed setup` copies Minimal's host skills (`minimal-setup`,
+`-config`, `-loadouts`, `-networking`, `-diag`) into `~/.agents/skills`
+(Zed's agent) and `~/.claude/skills` (Claude Code) on the Mac, marked
+`.min-zed-copy`; a skill directory of yours with the same name is left
+alone, and `setup --remove` takes out only the marked copies. In a box, the
+`zed` loadout puts Minimal's `minimal-sandbox` skill in `~/.claude/skills`,
+which Claude Agent picks up (seen 2026-10-29), so an agent can add a missing
+tool or package from inside the box instead of guessing.
+
+## Troubleshooting
+
+- **A Minimal task prints "not found".** It ran in a box window. Run it from
+  a local window, or press `` ctrl-alt-` `` and run `min-zed` there. On the
+  Mac, run `min-zed setup`.
+- **No "Minimal: New Box from Folder".** No folder is open in the window;
+  open one, or use **Minimal: New Empty Box**.
+- **No boxes in Remote Projects.** `min-zed config` (once), then
+  `min-zed attach NAME`. `min-zed doctor` shows missing or stale entries.
+- **"Could not connect".** `min-zed doctor`, then `ssh -v min-zed.NAME true`,
+  then `~/.local/state/min-zed/proxy.log` (one line per connection attempt).
+  Zed's log (**zed: open log**) shows the ProxyCommand's stderr.
+- **"no min-zed ssh stanza for this min-zed.\* host".** The session is gone,
+  or was never prepared by min-zed: `min-zed status`, then
+  `min-zed attach NAME`.
+- **Host key changed after recreating a session.** Reconnect: `_proxy`
+  re-pins before sshd starts.
+- **The terminal starts in `/home`.** The `min:workbench` rc line moves
+  interactive shells that start in `$HOME`; sessions without the loadout get
+  it on the next connect.
+
+## Not yet verified
+
+These need a live session and have not been checked end to end:
+
+- The Minimal tasks in Zed: `sh` as the task shell, the folder as the
+  working directory of New Box from Folder, the terminal hiding after a
+  window opens, pickers and `[y/N]` answered in a task terminal, and the
+  box-window line above.
+- `` ctrl-alt-` `` reaching `workspace::NewTerminal` (no system or keyboard
+  layout taking the key first). The action itself was seen opening a Mac
+  terminal from a box window.
+- Destroying the box a window is on closes that remote connection.
+- Claude Code's `terminal_bell` notification through Zed.
