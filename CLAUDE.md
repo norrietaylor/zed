@@ -30,8 +30,10 @@ own surfaces, which `setup` wires: the Remote Projects list
 - One `ssh_connections` entry per live own session,
   `{"host": "min-zed.NAME", "nickname": "NAME", "projects": [{"paths": ["/workbench"]}]}`:
   the Remote Projects modal (`ctrl-cmd-o`), reloaded live.
-- `tasks.json` block, seven tasks: `Minimal: New Box from Folder` (`new .`,
-  `cwd` `$ZED_WORKTREE_ROOT`, so not offered with no folder open),
+- `tasks.json` block, seven tasks: `Minimal: New Box from Folder` (`new .`
+  in the folder, given as `env` `MIN_ZED_TASK_FOLDER: $ZED_WORKTREE_ROOT`,
+  so not offered with no folder open; the command `cd`s there, or prints
+  one line when it is no folder: a single-file window's root is the file),
   `Minimal: New Empty Box` (`new --empty`), `Minimal: Open Box…` (`attach`:
   picker), `Minimal: Destroy Box…` (`destroy`: the cwd's box, else picker),
   `Minimal: Clean Up Idle Boxes…` (`gc`), `Minimal: Status`,
@@ -42,8 +44,8 @@ own surfaces, which `setup` wires: the Remote Projects list
   The CLI's own y/N questions and numbered pickers are the UI.
   `reveal: always`, `use_new_terminal: false`, `allow_concurrent_runs:
   false`, `show_command: false`; `hide: on_success` for the three that open
-  a window, `never` for the rest. No `$ZED_*` variable in a command: Zed
-  pastes them in unquoted.
+  a window, `never` for the rest. No `$ZED_*` variable in a command or
+  `cwd`: Zed pastes them into a command unquoted, and a root may be a file.
 - `keymap.json` block: `` ctrl-alt-` `` → `["workspace::NewTerminal", {"local": true}]`
   in context `Workspace`: a Mac terminal from a box window. Free in Zed
   1.26.2's default macOS keymap, beside `` ctrl-` `` (terminal panel) and
@@ -73,16 +75,20 @@ own surfaces, which `setup` wires: the Remote Projects list
   Settings: only entries whose host starts with the prefix are added or
   removed; an existing entry of ours is kept verbatim; every other byte
   (comments between entries, CRLF, BOM) stays; the key is removed only if we
-  added it (`STATE/settings-key-added`). Tasks/keymap: the block between
-  `// min-zed:begin` and `// min-zed:end` right after the array's `[` is
+  added it (`STATE/settings-key-added`); adding ours and taking them out
+  again gives back the bytes (a comment after the user's last entry stays
+  on its line). 0.1.0's `STATE/zed-config-installed` and `zed-config.json`
+  are taken over once (opt-in, key added, file created). Tasks/keymap: the
+  block between `// min-zed:begin` and `// min-zed:end` (the marks only as
+  comment lines of their own, the first right after the top-level `[`) is
   ours and rewritten whole (Zed's keymap editor appends after it); a file
   with no array gets one marked `// min-zed:array`, taken out with the block
   while nothing else went into it. For all three: dated backup in
   `STATE/backups/` before a write; written through a symlink, replaced
   atomically; never written when unchanged; `--remove` restores the bytes it
   found and deletes a file it created (`STATE/<file>-created`) once empty; a
-  file that does not parse (or has the wrong top level) is refused, and then
-  none of the three is written. Settings sync is skipped when `min ls` fails.
+  file that does not parse (or is not UTF-8, or has the wrong top level) is
+  refused, and then none of the three is written. Settings sync is skipped when `min ls` fails.
 - The host key is pinned (`StrictHostKeyChecking=yes`); never `accept-new`.
 - Agent and X11 forwarding stay off on every client path: one option list
   (`ssh_common`) feeds both the stanza and `ssh_opts`.
@@ -116,7 +122,8 @@ own surfaces, which `setup` wires: the Remote Projects list
   byte-identical.
 - Install never edits `default_loadouts`; `setup --remove` (`just uninstall`)
   removes only our own links, marked skill copies, Zed entries and blocks,
-  and Include. `setup` replaces a link only when missing, dangling, or
+  and Include; when the merger refuses a Zed file it removes nothing else
+  and fails. `setup` replaces a link only when missing, dangling, or
   pointing to another copy of the same file (a moved checkout); stanzas bake
   the `~/.local/bin` link, so it follows the checkout.
 
@@ -149,7 +156,9 @@ own surfaces, which `setup` wires: the Remote Projects list
 - Zed task commands go through `shellexpand` (Zed source, v1.26.2): `$ZED_*`
   variables are pasted into the command text unquoted, a task whose
   `$ZED_*` variable is unset is not offered, other `$VARS` are left to the
-  shell. Tasks run in an interactive terminal (`sh -i -c`), so `[ -t 0 ]`
+  shell. `env` values get the same substitution but are no shell text, and
+  the task variables are exported too. `ZED_WORKTREE_ROOT` is set without a
+  directory check: in a single-file window it is the file. Tasks run in an interactive terminal (`sh -i -c`), so `[ -t 0 ]`
   holds.
 - Zed downloads its remote server into the box itself:
   `~/.zed_server/zed-remote-server-stable-<ver>+stable.<build>.<sha>`.
@@ -180,7 +189,7 @@ own surfaces, which `setup` wires: the Remote Projects list
 ## Unverified (needs a live session)
 
 - The Minimal tasks end to end in Zed: `sh` as the task shell, the
-  `$ZED_WORKTREE_ROOT` cwd, `hide: on_success` after a window opens, the
+  folder through `env`, `hide: on_success` after a window opens, the
   pickers and y/N answered in a task terminal, the box-window guard line.
 - `` ctrl-alt-` `` reaching `workspace::NewTerminal` (no OS or layout grab).
 - Destroying the box a window is on closes that remote connection.

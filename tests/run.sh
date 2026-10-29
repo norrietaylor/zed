@@ -607,6 +607,32 @@ case_settings_follow_sessions() {
     [ "$(cfg_hosts)" = "box.example" ] || fail "sync after opt-out: $(cfg_hosts)"
 }
 
+# 0.1.0's opt-in (STATE/zed-config-installed) and record (zed-config.json)
+# are taken over once: sync goes on, and --remove still drops the key and the
+# file 0.1.0 made.
+case_settings_take_over_old_opt_in() {
+    mkdir -p "$T/zed"
+    printf '{\n  "theme": "x",\n  "ssh_connections": [{"host": "%sgone"}]\n}\n' "$HP" > "$SETTINGS"
+    : > "$STATE/zed-config-installed"; printf '{"created_file": false, "added_key": true}\n' > "$STATE/zed-config.json"
+    run ssh alpha -- true
+    assert_rc 0
+    [ "$(cfg_hosts)" = "${HP}alpha" ] || fail "not synced: $(cat "$SETTINGS")"
+    assert_file "$STATE/settings-installed"; assert_file "$STATE/settings-key-added"
+    assert_no_file "$STATE/settings-created"
+    assert_no_file "$STATE/zed-config-installed"; assert_no_file "$STATE/zed-config.json"
+    run_cfg --sync
+    [ "$(settings_get 'has("ssh_connections")')" = false ] || fail "the key 0.1.0 added stayed: $(cat "$SETTINGS")"
+    assert_file_contains "$SETTINGS" '"theme": "x"'
+    # a file 0.1.0 created goes on --remove
+    rm -f "$STATE"/settings-*
+    printf '{\n  "ssh_connections": [{"host": "%salpha"}]\n}\n' "$HP" > "$SETTINGS"
+    : > "$STATE/zed-config-installed"; printf '{"created_file": true, "added_key": true}\n' > "$STATE/zed-config.json"
+    run config --remove
+    assert_rc 0
+    zed_files_absent
+    assert_no_file "$STATE/settings-installed"; assert_no_file "$STATE/zed-config-installed"
+}
+
 # `zed-config` is `config` by its old name.
 case_config_zed_config_alias() {
     installed
@@ -784,6 +810,42 @@ EOF
     [ "$(cfg_hosts)" = "box.example other.example" ] || fail "hosts: $(cfg_hosts)"
 }
 
+# Several of ours after the user's last entry go in and out byte for byte,
+# whatever the user's framing; a comment after the user's entry stays on its
+# line (ours go after it, not between it and its entry).
+case_merger_trailing_entries_round_trip() {
+    mkdir -p "$T/zed"
+    for probe in '{\n  "ssh_connections": [\n    {"host": "a"}\n  ]\n}\n' '{\n  "ssh_connections": [{"host": "a"}]\n}\n' \
+            '{\n  "ssh_connections": [{"host": "a"},]\n}\n' '{\n  "ssh_connections": [\n    {"host": "a"} // c\n  ]\n}\n' \
+            '{\r\n  "ssh_connections": [\r\n    {"host": "a"} // c\r\n  ]\r\n}\r\n'; do
+        rm -f "$SETTINGS" "$STATE"/settings-*
+        # shellcheck disable=SC2059  # the probe is a printf format on purpose
+        printf "$probe" > "$SETTINGS"; cp "$SETTINGS" "$T/orig.json"
+        run_cfg --install --sync x y z
+        assert_rc 0
+        [ "$(cfg_hosts)" = "a ${HP}x ${HP}y ${HP}z" ] || fail "$probe: hosts: $(cfg_hosts)"
+        case $probe in *'// c'*) assert_file_contains "$SETTINGS" '{"host": "a"}, // c' ;; esac
+        run_cfg --sync y
+        [ "$(cfg_hosts)" = "a ${HP}y" ] || fail "$probe: after sync: $(cfg_hosts)"
+        run_cfg --remove
+        assert_rc 0
+        cmp -s "$T/orig.json" "$SETTINGS" || { fail "$probe: not restored byte for byte"; od -c "$SETTINGS" | sed 's/^/#   /' >&2; }
+    done
+}
+
+# A list holding only a comment keeps it while ours are in it, and gets it
+# back as it was.
+case_merger_comment_only_list_kept() {
+    mkdir -p "$T/zed"
+    printf '{\n  "ssh_connections": [\n    // only comment\n  ]\n}\n' > "$SETTINGS"; cp "$SETTINGS" "$T/orig.json"
+    run_cfg --install --sync x y
+    assert_rc 0
+    [ "$(cfg_hosts)" = "${HP}x ${HP}y" ] || fail "hosts: $(cfg_hosts)"
+    assert_file_contains "$SETTINGS" '// only comment'
+    run_cfg --remove
+    cmp -s "$T/orig.json" "$SETTINGS" || { fail "not restored byte for byte"; sed 's/^/#   /' "$SETTINGS" >&2; }
+}
+
 # Written by one rename beside the real file: a dotfiles symlink stays one,
 # its mode is kept, no temp file is left.
 case_merger_symlink_written_through() {
@@ -841,6 +903,19 @@ case_merger_bad_input_refused() {
     assert_no_file "$STATE/settings-installed"
 }
 
+# A file that is not UTF-8 is refused like one that does not parse.
+case_merger_non_utf8_refused() {
+    mkdir -p "$T/zed"
+    printf '{"theme": "\377"}\n' > "$SETTINGS"; cp "$SETTINGS" "$T/orig.settings"
+    run_cfg --install --sync alpha
+    assert_rc 1
+    assert_err_contains "$SETTINGS: cannot parse or edit as JSONC"
+    ! grep -q Traceback "$T/err" || fail "traceback: $(cat "$T/err")"
+    cmp -s "$SETTINGS" "$T/orig.settings" || fail "file changed"
+    assert_no_file "$TASKS"; assert_no_file "$KEYMAP"
+    assert_no_file "$STATE/settings-installed"
+}
+
 # ---- the tasks and keymap blocks ----
 
 # Every shape a tasks.json or keymap.json may start in: the block goes in,
@@ -889,11 +964,13 @@ case_blocks_content() {
     [ "$(jsonc_get "$TASKS" 'map(.label) | join("|")')" = '"Minimal: New Box from Folder|Minimal: New Empty Box|Minimal: Open Box…|Minimal: Destroy Box…|Minimal: Clean Up Idle Boxes…|Minimal: Status|Minimal: Doctor"' ] \
         || fail "labels: $(jsonc_get "$TASKS" 'map(.label)')"
     [ "$(jsonc_get "$TASKS" 'map(.shell.program) | unique')" = '["sh"]' ] || fail "shell"
+    # the folder through env (a value), not cwd (a file in a single-file window)
     # shellcheck disable=SC2016  # Zed's variable, literal
-    [ "$(jsonc_get "$TASKS" '.[0].cwd')" = '"$ZED_WORKTREE_ROOT"' ] || fail "cwd: $(jsonc_get "$TASKS" '.[0].cwd')"
+    [ "$(jsonc_get "$TASKS" '.[0].env')" = '{"MIN_ZED_TASK_FOLDER":"$ZED_WORKTREE_ROOT"}' ] || fail "env: $(jsonc_get "$TASKS" '.[0].env')"
+    [ "$(jsonc_get "$TASKS" 'map(has("cwd")) | any')" = false ] || fail "a task sets cwd"
     [ "$(jsonc_get "$TASKS" 'map(.hide) | join(" ")')" = '"on_success on_success on_success never never never never"' ] || fail "hide"
     # no $ZED_ variable in a command: Zed would paste it in unquoted
-    [ "$(jsonc_get "$TASKS" 'map(.command | test("ZED_")) | any')" = false ] || fail "a command names a ZED_ variable"
+    [ "$(jsonc_get "$TASKS" 'map(.command | test("[$][{]?ZED_")) | any')" = false ] || fail "a command names a ZED_ variable"
     [ "$(jsonc_get "$KEYMAP" '.[0]')" = '{"context":"Workspace","bindings":{"ctrl-alt-`":["workspace::NewTerminal",{"local":true}]}}' ] \
         || fail "keymap: $(jsonc_get "$KEYMAP" '.')"
     assert_file "$STATE/tasks-created"
@@ -917,11 +994,55 @@ case_blocks_task_runs_cli_or_says_where() {
     printf '#!/bin/sh\necho "cli $*" >> "%s"\n' "$STUB_LOG" > "$B/.local/bin/$TOOL"; chmod +x "$B/.local/bin/$TOOL"
     i=0
     for want in "new ." "new --empty" attach destroy gc status doctor; do
-        HOME=$B sh -c "$(task_cmd $i)" < /dev/null; RC=$?
+        HOME=$B MIN_ZED_TASK_FOLDER=$P sh -c "$(task_cmd $i)" < /dev/null; RC=$?
         assert_rc 0
         assert_log_contains "cli $want"
         i=$((i + 1))
     done
+}
+
+# zed_task N ROOT: task N of $TASKS run as Zed 1.26.2 resolves it in a
+# window whose worktree root is ROOT: $ZED_* pasted into the command, cwd and
+# env values as they are, the task variables exported too, the command
+# through its shell in cwd.
+zed_task() {
+    python3 - "$TASKS" "$CFG" "$1" "$2" <<'PY' > "$T/out" 2>&1
+import os, re, subprocess, sys
+src = open(sys.argv[2]).read().replace('if __name__ == "__main__":\n    main()', '')
+m = {}
+exec(compile(src, 'min-zed-config', 'exec'), m)
+t = m['load_jsonc'](open(sys.argv[1]).read())[int(sys.argv[3])]
+v = {"ZED_WORKTREE_ROOT": sys.argv[4]}
+sub = lambda s: re.sub(r"\$\{?(ZED_[A-Z_]+)\}?", lambda x: v[x.group(1)], s)
+env = dict(os.environ, **v, **{k: sub(x) for k, x in t.get("env", {}).items()})
+try:
+    r = subprocess.run([t["shell"]["program"], "-c", sub(t["command"])], cwd=sub(t["cwd"]) if "cwd" in t else None,
+                       env=env, stdin=subprocess.DEVNULL)
+except OSError as e:
+    sys.exit(f"spawn failed: {e}")
+sys.exit(r.returncode)
+PY
+    RC=$?
+}
+
+# New Box from Folder makes the box from the window's folder whatever its
+# name holds; in a single-file window (the worktree root is the file) it says
+# so in one line and makes nothing.
+case_blocks_folder_task_any_path_or_says_why() {
+    run_cfg --install --sync
+    B=$T/boxhome; mkdir -p "$B/.local/bin"
+    # shellcheck disable=SC2016  # pwd runs in the stub
+    printf '#!/bin/sh\necho "cli $* in $(pwd -P)" >> "%s"\n' "$STUB_LOG" > "$B/.local/bin/$TOOL"; chmod +x "$B/.local/bin/$TOOL"
+    d="$T/my \"odd\" dir's \$HOME; x"; mkdir -p "$d"
+    HOME=$B zed_task 0 "$d"
+    assert_rc 0
+    assert_log_contains "cli new . in $d"
+    : > "$d/notes.txt"
+    HOME=$B zed_task 0 "$d/notes.txt"
+    assert_rc 1
+    [ "$(wc -l < "$T/out" | tr -d ' ')" = 1 ] || fail "not one line: $(cat "$T/out")"
+    assert_out_contains "$TOOL: $d/notes.txt is not a folder; open a folder in Zed to make a box from it."
+    assert_log_count 1 "cli new"
 }
 
 # Only --install writes the blocks: a sync (open, destroy) leaves tasks and
@@ -975,6 +1096,26 @@ PY
   {"bindings": {"cmd-k x": "zed::Quit"}}
 ]'
     assert_no_file "$STATE/keymap-created"
+}
+
+# Our marks count only as our own comment lines, the begin mark right after
+# the array's `[`: the same text in a user's string or comment is theirs.
+case_blocks_marks_only_as_our_comments() {
+    mkdir -p "$T/zed"
+    printf '[\n  {"label": "// %s:begin"},\n  {"label": "// %s:end"}\n]\n' "$TOOL" "$TOOL" > "$KEYMAP"
+    printf '// x // %s:begin\n[{"label": "// %s:array"}, {"label": "// %s:end"}]\n' "$TOOL" "$TOOL" "$TOOL" > "$TASKS"
+    cp "$KEYMAP" "$T/orig.keymap"; cp "$TASKS" "$T/orig.tasks"
+    run_cfg --install --sync
+    assert_rc 0
+    [ "$(jsonc_get "$KEYMAP" 'length')" = 3 ] || fail "keymap: $(cat "$KEYMAP")"
+    [ "$(jsonc_get "$TASKS" 'length')" = 9 ] || fail "tasks: $(cat "$TASKS")"
+    cp "$KEYMAP" "$T/installed"
+    run_cfg --install --sync
+    cmp -s "$T/installed" "$KEYMAP" || fail "a second install changed the keymap: $(cat "$KEYMAP")"
+    run_cfg --remove
+    assert_rc 0
+    cmp -s "$T/orig.keymap" "$KEYMAP" || { fail "keymap not restored"; sed 's/^/#   /' "$KEYMAP" >&2; }
+    cmp -s "$T/orig.tasks" "$TASKS" || { fail "tasks not restored"; sed 's/^/#   /' "$TASKS" >&2; }
 }
 
 # A tasks or keymap file that does not parse, or is no array, is refused
@@ -1200,6 +1341,32 @@ case_setup_installs_follows_and_removes() {
 
 # loadout_hook N: the Nth (from 0) inline on_activate script of the loadout,
 # between the lines `on_activate.value = '''` and `'''`.
+# setup --remove with a Zed file the merger refuses removes nothing else and
+# fails: the tasks there still run the CLI, the entries need the stanzas.
+case_setup_remove_stops_when_config_refuses() {
+    cl=$HOME/.local/bin/$TOOL
+    ld=$HOME/.config/minimal/loadouts/zed.toml
+    run setup
+    assert_rc 0
+    printf '{ broken' > "$SETTINGS"
+    run setup --remove
+    assert_rc 1
+    assert_err_contains "fix the file, then run $TOOL setup --remove again"
+    [ -L "$cl" ] || fail "CLI link removed"
+    [ -L "$ld" ] || fail "loadout link removed"
+    assert_file "$HOME/.claude/skills/minimal-config/SKILL.md"
+    assert_file "$HOME/$CONF"
+    assert_file_contains "$HOME/.ssh/config" "$MARK2"
+    assert_file "$STATE/settings-installed"
+    [ "$(jsonc_get "$TASKS" 'length')" = 7 ] || fail "tasks: $(cat "$TASKS")"
+    printf '{}\n' > "$SETTINGS"
+    run setup --remove
+    assert_rc 0
+    assert_no_file "$cl"
+    assert_no_file "$HOME/$CONF"
+    assert_no_file "$TASKS"
+}
+
 loadout_hook() {
     awk -v want="$1" -v q="'''" '$0 == "on_activate.value = " q { on = (n++ == want); next }
         $0 == q { on = 0; next } on' "$ROOT/loadouts/zed.toml"
@@ -1943,15 +2110,18 @@ attach_launches_existing attach_picker_rejects_zero open_without_editor_fails_af
 names_from_min
 destroy_asks_and_cleans_up destroy_by_cwd destroy_by_cwd_only_own destroy_picker_on_a_terminal in_use_reads_ps gc_lists_oldest_first_and_asks
 gc_offers_only_own_sessions status_tracks_orphans status_table
-settings_untouched_before_opt_in settings_follow_sessions config_zed_config_alias settings_sync_skipped_when_min_ls_fails
+settings_untouched_before_opt_in settings_follow_sessions settings_take_over_old_opt_in config_zed_config_alias settings_sync_skipped_when_min_ls_fails
 config_print_and_bad_option config_and_doctor_keep_entries_when_min_ls_fails
 merger_keeps_comments_and_foreign_entries merger_fresh_file_and_noop merger_remove_restores_framing
 merger_keeps_hand_tuned_entry merger_keeps_comments_between_entries merger_symlink_written_through
 merger_remove_undoes_only_what_we_made merger_bad_input_refused
+merger_trailing_entries_round_trip merger_comment_only_list_kept merger_non_utf8_refused
 blocks_install_idempotent_remove_exact blocks_content blocks_task_runs_cli_or_says_where blocks_only_from_install
-blocks_refreshed_when_edited blocks_users_entry_in_our_array_kept blocks_refuse_bad_files
+blocks_folder_task_any_path_or_says_why
+blocks_refreshed_when_edited blocks_users_entry_in_our_array_kept blocks_refuse_bad_files blocks_marks_only_as_our_comments
 doctor_rows doctor_min_version
 new_empty_no_window attach_no_window destroy_if_idle destroy_unsaved_needs_force status_json setup_installs_follows_and_removes
+setup_remove_stops_when_config_refuses
 loadout_rc_line_once loadout_skill_only_for_claude
 sshconfig_install_creates_include_and_stanza sshconfig_remove_restores_original
 sshconfig_coexists_with_another_tool sshconfig_keeps_symlinked_config sshconfig_print_touches_nothing

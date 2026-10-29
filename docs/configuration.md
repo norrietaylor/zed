@@ -51,3 +51,5 @@ from `~/.ssh/config` (byte-identical to before; `~/.ssh/min-zed.conf` is
 deleted), removes the loadout and CLI symlinks if they point into this
 checkout, and the loadout copy and skill copies marked as min-zed's. It
 leaves the state directory, which holds the session keys and every backup.
+If one of Zed's files does not parse, it stops before removing anything
+else and says so: fix the file, then run it again.

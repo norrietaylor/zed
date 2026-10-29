@@ -54,7 +54,9 @@ key instead.
   completions consider only sessions min-zed has connected to.
 - The plumbing is no longer a vendored kernel block; it lives in
   `bin/min-zed` directly.
-- `zed-config` is now `config` (`zed-config` still works).
+- `zed-config` is now `config` (`zed-config` still works). 0.1.0's opt-in
+  and record (`zed-config-installed`, `zed-config.json`) are taken over on
+  the first run.
 - Needs min 0.7.0 or newer (`doctor` fails on older).
 
 ### Removed

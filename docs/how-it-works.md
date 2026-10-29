@@ -123,25 +123,35 @@ comments (keeping byte offsets) to parse a file, then makes textual edits:
   `min-zed.` and are not live are deleted, and live sessions without one get
   `{"host": "min-zed.NAME", "nickname": "NAME", "projects": [{"paths":
   ["/workbench"]}]}` appended; every other entry and the comments between
-  entries stay. Without the key, it is spliced in after the opening brace
-  and recorded (`STATE/settings-key-added`), so `--remove` takes it out
-  only then.
+  entries stay. A comment after your last entry stays on its line; taking
+  min-zed's entries out again gives back the bytes. Without the key, it is
+  spliced in after the opening brace and recorded
+  (`STATE/settings-key-added`), so `--remove` takes it out only then.
 - **tasks.json, keymap.json.** A block between `// min-zed:begin` and
   `// min-zed:end` right after the array's `[`, holding the seven tasks or
-  the one binding, rewritten whole. A file without an array gets one marked
+  the one binding, rewritten whole. The marks count only as comment lines
+  of their own, the first right after the top-level `[`: the same text in
+  your string or comment is yours. A file without an array gets one marked
   `// min-zed:array`.
 
 `--sync NAME...` (from `open`, `attach`, `ssh`, `destroy`, `gc`) is the
 full set of live prepared sessions and touches only `settings.json`;
 `--install` (from `config` and `setup`) also writes the two blocks. The
 opt-in record is `STATE/settings-installed`: `--sync` does nothing before
-it. A refresh is skipped when `min ls` fails, so a transient error never
+it. 0.1.0's records (`STATE/zed-config-installed`, `STATE/zed-config.json`)
+are taken over on the first run, so its opt-in, the key it added and the
+file it created carry over. A refresh is skipped when `min ls` fails, so a transient error never
 empties the list. All three files are planned before any is written: one
 that does not parse stops all three.
 
 Each task runs, through `sh`, `$HOME/.local/bin/min-zed` with fixed
 arguments, or prints where to run it when that file is missing (in a box
-window, global tasks run in the box). Its terminal is the UI: the CLI's
+window, global tasks run in the box). New Box from Folder gets its folder
+as `MIN_ZED_TASK_FOLDER` in the task's `env`, set from `$ZED_WORKTREE_ROOT`:
+an env value is no shell text (Zed pastes `$ZED_*` into a command
+unquoted), and with no folder open Zed does not offer the task. The
+command `cd`s there, or, when it is no folder (a window on a single file),
+says so in one line. Its terminal is the UI: the CLI's
 numbered pickers and `[y/N]` questions read from it.
 
 ## State directory

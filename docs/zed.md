@@ -84,7 +84,7 @@ Run them with **task: spawn** (`cmd-shift-r`) and type "Minimal":
 
 | Task | Runs | Notes |
 |---|---|---|
-| Minimal: New Box from Folder | `min-zed new .` in the open folder | offered only with a folder open |
+| Minimal: New Box from Folder | `min-zed new .` in the open folder | offered only with a folder open; a window on a single file says it needs a folder |
 | Minimal: New Empty Box | `min-zed new --empty` | |
 | Minimal: Open Box… | `min-zed attach` | numbered picker |
 | Minimal: Destroy Box… | `min-zed destroy` | the folder's box, else a picker; asks `[y/N]` |
@@ -198,7 +198,8 @@ tool or package from inside the box instead of guessing.
   a local window, or press `` ctrl-alt-` `` and run `min-zed` there. On the
   Mac, run `min-zed setup`.
 - **No "Minimal: New Box from Folder".** No folder is open in the window;
-  open one, or use **Minimal: New Empty Box**.
+  open one, or use **Minimal: New Empty Box**. In a window on a single file
+  the task says "… is not a folder" instead.
 - **No boxes in Remote Projects.** `min-zed config` (once), then
   `min-zed attach NAME`. `min-zed doctor` shows missing or stale entries.
 - **"Could not connect".** `min-zed doctor`, then `ssh -v min-zed.NAME true`,
@@ -217,8 +218,8 @@ tool or package from inside the box instead of guessing.
 
 These need a live session and have not been checked end to end:
 
-- The Minimal tasks in Zed: `sh` as the task shell, the folder as the
-  working directory of New Box from Folder, the terminal hiding after a
+- The Minimal tasks in Zed: `sh` as the task shell, the folder reaching
+  New Box from Folder through the task's `env`, the terminal hiding after a
   window opens, pickers and `[y/N]` answered in a task terminal, and the
   box-window line above.
 - `` ctrl-alt-` `` reaching `workspace::NewTerminal` (no system or keyboard

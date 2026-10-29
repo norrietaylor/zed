@@ -835,10 +835,11 @@ run_config() {
 
 # settings_sync: one ssh_connections entry per prepared live session (Zed's
 # Remote Projects list); the tasks and keymap blocks only `config` writes.
-# A no-op until `config` has run, never fatal, and skipped when min ls fails
-# (a partial list would drop entries).
+# A no-op until `config` has run (or 0.1.0's `zed-config`, whose record the
+# merger takes over), never fatal, and skipped when min ls fails (a partial
+# list would drop entries).
 settings_sync() {
-    [ -f "$STATE/settings-installed" ] || return 0
+    [ -f "$STATE/settings-installed" ] || [ -f "$STATE/zed-config-installed" ] || return 0
     have "${PYTHON:-python3}" || { log "python3 not found; $EDITOR_NAME settings not refreshed"; return 0; }
     names=$(prepared_live) || { log "min ls failed; $EDITOR_NAME settings not refreshed"; return 0; }
     # shellcheck disable=SC2086  # names are valid_name words
@@ -910,7 +911,10 @@ cmd_setup() {
     case ${1:-} in
         '') ;;
         --remove)
-            cmd_config --remove || :
+            # Zed's files first: while they still name our hosts and run our
+            # CLI, the CLI and the ssh stanzas stay too
+            cmd_config --remove \
+                || die "setup --remove: $EDITOR_NAME's files still hold $TOOL's entries (see above); fix the file, then run $TOOL setup --remove again (nothing else was removed)"
             cmd_ssh_config --remove
             for pair in "$ld:$lo" "$cl:$SELF"; do
                 f=${pair%%:*} t=${pair#*:}

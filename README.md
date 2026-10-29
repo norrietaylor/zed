@@ -144,7 +144,8 @@ just uninstall
 
 That is `min-zed setup --remove`: it takes out only what min-zed added (the
 Zed entries and blocks, the ssh Include, the marked skill copies, the
-links). Your boxes keep running; destroy them first if you are done with
+links); if one of Zed's files does not parse, it stops and removes nothing
+else until you fix it. Your boxes keep running; destroy them first if you are done with
 them. Boxes stay in Zed's recent projects until you remove them there (Open
 Recent).
 

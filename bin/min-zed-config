@@ -76,26 +76,38 @@ KEYMAP = [
 ]
 
 
-def task(label, args, hide="never", cwd=None):
+# The window's folder, for "New Box from Folder": set from $ZED_WORKTREE_ROOT
+# in the task's env (a value, never shell text), read by the command as a
+# plain variable.
+FOLDER_VAR = "MIN_ZED_TASK_FOLDER"
+
+
+def task(label, args, hide="never", folder=False):
     """A Zed task running `TOOL ARGS` in a terminal, through sh whatever the
     login shell is. A global task runs in the box in a box window, where the
-    CLI is missing: there it says where to run it instead."""
+    CLI is missing: there it says where to run it instead. With folder, it
+    runs in the window's folder, and says so when that is a file."""
     cmd = (f'm="$HOME/.local/bin/{TOOL}"; [ ! -x "$m" ] || exec "$m" {args}; '
            f'echo "{TOOL}: $m not found."\' In a box window, run Minimal tasks from a local window '
            f'or a Mac terminal ({LOCAL_TERMINAL_KEY}); on the Mac, run {TOOL} setup.\'; exit 1')
     t = {"label": label, "command": cmd}
-    if cwd:
-        t["cwd"] = cwd
+    if folder:
+        t["command"] = (f'[ -d "${FOLDER_VAR}" ] || {{ printf \'%s\\n\' "{TOOL}: ${FOLDER_VAR} is not a folder; '
+                        f'open a folder in {EDITOR_NAME} to make a box from it."; exit 1; }}; '
+                        f'cd -- "${FOLDER_VAR}" || exit 1; {cmd}')
+        t["env"] = {FOLDER_VAR: "$ZED_WORKTREE_ROOT"}
     t.update({"use_new_terminal": False, "allow_concurrent_runs": False, "reveal": "always",
               "hide": hide, "shell": {"program": "sh"}, "show_command": False})
     return t
 
 
 # A task that opens a window hides its terminal once it did (on_success);
-# the others leave theirs to be read. "New Box from Folder" names its folder
-# through cwd: with no folder open the variable is unset and Zed hides it.
+# the others leave theirs to be read. "New Box from Folder" gets its folder
+# through env, not cwd (in a single-file window Zed 1.26.2's worktree root is
+# the file) nor the command (Zed pastes $ZED_* in unquoted); with no folder
+# open the variable is unset and Zed does not offer the task.
 TASKS = [
-    task("Minimal: New Box from Folder", "new .", "on_success", "$ZED_WORKTREE_ROOT"),
+    task("Minimal: New Box from Folder", "new .", "on_success", folder=True),
     task("Minimal: New Empty Box", "new --empty", "on_success"),
     task("Minimal: Open Box…", "attach", "on_success"),
     task("Minimal: Destroy Box…", "destroy"),
@@ -248,22 +260,13 @@ def line_indent(text, pos):
     return m.group(0) if m else ""
 
 
-def line_bounds(text, st, en):
-    """Widen [st, en) to whole lines when nothing else is on them (keeps CRLF pairs whole)."""
-    ls = text.rfind("\n", 0, st) + 1
-    le = text.find("\n", en)
-    le = len(text) if le < 0 else le
-    if text[ls:st].strip() == "" and text[en:le].strip() == "":
-        return ls, (le + 1 if le < len(text) else le)
-    return st, en
-
-
 def apply_edits(text, edits):
-    """Apply (start, end, replacement) edits; deletions are merged when they overlap."""
+    """Apply (start, end, replacement) edits; deletions are merged when they overlap
+    (not when they only touch: an insertion may sit between them)."""
     dels = sorted((a, b) for a, b, r in edits if b > a)
     merged = []
     for a, b in dels:
-        if merged and a <= merged[-1][1]:
+        if merged and a < merged[-1][1]:
             merged[-1][1] = max(merged[-1][1], b)
         else:
             merged.append([a, b])
@@ -298,34 +301,50 @@ def edit_array(text, s, kstart, vstart, vend, want, eol):
     remaining = [i for i in range(len(info)) if i not in removes]
     if not removes and not adds:
         return text, len(info)
+    # Each entry goes with its comma and the whitespace before it (a comment
+    # there stays): the inverse of an insert. Ours at the end with no comma
+    # after the last take the comma of the entry kept before them too.
+    tail = []
+    if removes and removes[-1] == len(info) - 1 and info[-1][3] is None:
+        tail = [removes[-1]]
+        while tail[0] - 1 in removes:
+            tail.insert(0, tail[0] - 1)
     edits = []
     for idx in removes:
         a, b, _, ca = info[idx]
-        if ca is not None:
-            st, en = a, ca + 1
-        else:
-            prev_end = info[idx - 1][1] if idx > 0 else vstart + 1
-            pos = c.rfind(",", prev_end, a)
-            st, en = (pos, b) if pos >= 0 else (a, b)
-        edits.append((*line_bounds(text, st, en), ""))
+        st = a
+        while text[st - 1].isspace():
+            st -= 1
+        edits.append((st, b if ca is None else ca + 1, ""))
+    if tail and tail[0] > 0 and info[tail[0] - 1][3] is not None:
+        ca = info[tail[0] - 1][3]
+        edits.append((ca, ca + 1, ""))
     kind = line_indent(text, kstart) + "  "
     if adds and remaining:
         a, b, _, ca = info[remaining[-1]]
         ls = text.rfind("\n", 0, a) + 1
         ind = text[ls:a] if text[ls:a].strip() == "" else kind
-        le = text.find("\n", ca) if ca is not None else -1
-        if remaining[-1] == len(info) - 1 and le >= 0 and c[ca + 1:le].strip() == "":
+        le = text.find("\n", b if ca is None else ca)
+        at = le - 1 if le >= 0 and text[le - 1] == "\r" else le
+        if not tail and ca is not None and le >= 0 and c[ca + 1:le].strip() == "":
             # trailing-comma style: new lines after that line (its comment stays put)
-            at = le - 1 if text[le - 1] == "\r" else le
             edits.append((at, at, "".join(f"{eol}{ind}{render(n)}," for n in adds)))
+        elif (tail or ca is None) and le >= 0 and re.fullmatch(r"\s*,?\s*", c[b:le]):
+            # the last entry ends its line (perhaps with a comment): a comma
+            # after it, the new lines after the comment
+            new = ",".join(f"{eol}{ind}{render(n)}" for n in adds)
+            edits += [(b, b, "," + new)] if at == b else [(b, b, ","), (at, at, new)]
         else:
             edits.append((b, b, "".join(f",{eol}{ind}{render(n)}" for n in adds)))
-    elif adds and s[vstart + 1:vend - 1].strip() == "":
+    elif adds and text[vstart + 1:vend - 1].strip() == "":
         body = ("," + eol).join(f"{kind}{render(n)}" for n in adds)
         edits.append((vstart, vend, f"[{eol}{body}{eol}{kind[:-2]}]"))
     elif adds:
-        edits.append((vstart + 1, vstart + 1, "".join(f"{eol}{kind}{render(n)}" + ("," if k < len(adds) - 1 else "")
-                                                      for k, n in enumerate(adds))))
+        # after the bracket's line when only a comment follows it there
+        le = text.find("\n", vstart)
+        at = (le - 1 if text[le - 1] == "\r" else le) if le >= 0 and c[vstart + 1:le].strip() == "" else vstart + 1
+        edits.append((at, at, "".join(f"{eol}{kind}{render(n)}" + ("," if k < len(adds) - 1 else "")
+                                      for k, n in enumerate(adds))))
     out = apply_edits(text, edits)
     if not remaining and not adds:
         # nothing left: an array that is now only whitespace goes back to []
@@ -390,11 +409,25 @@ def plan_settings(text, names, we_added_key=False):
 
 # ---- tasks.json, keymap.json: a marked block in the top-level array ----
 
+def marker(text, s, mark, start):
+    """Index of mark from start on as a line comment of its own (not in a
+    string or behind other text; s is text stripped), or -1."""
+    i = text.find(mark, start)
+    while i >= 0 and (s[i] != " " or text[text.rfind("\n", 0, i) + 1 : i].strip()):
+        i = text.find(mark, i + 1)
+    return i
+
+
 def block_span(text):
-    """(line_start, line_end) of our marked block, or None."""
-    b = text.find(BEGIN)
-    e = text.find(END, b + 1) if b >= 0 else -1
-    if b < 0 or e < 0:
+    """(line_start, line_end) of our marked block, or None: its markers as we
+    write them, the first right after the top-level array's `[`."""
+    s = strip_jsonc(text)
+    top = ws(s, 0)
+    if top >= len(s) or s[top] != "[":
+        return None
+    b = marker(text, s, BEGIN, top + 1)
+    e = marker(text, s, END, b + 1) if b >= 0 else -1
+    if b < 0 or e < 0 or s[top + 1 : b].strip():
         return None
     line_start = text.rfind("\n", 0, b) + 1
     line_end = text.find("\n", e)
@@ -428,10 +461,12 @@ def plan_block(text, values, remove):
         raise ValueError("top level is not an array")
     if remove:
         m = out.find(ARRAY)
+        while m >= 0 and s[m] != " ":   # in a string, not our comment
+            m = out.find(ARRAY, m + 1)
         if m < 0:
             return out
         b = out.rfind("[", out.rfind("\n", 0, m) + 1, m)
-        if b < 0:
+        if b < 0 or b != ws(s, 0):
             return out
         le = out.find("\n", m)   # the end of the marked line, before its CR
         le = len(out) if le < 0 else le - (out[le - 1] == "\r")
@@ -527,6 +562,28 @@ def setflag(f, on):
         os.unlink(f)
 
 
+def take_over_old_state(state):
+    """0.1.0 kept its opt-in in STATE/zed-config-installed and what it made in
+    STATE/zed-config.json ({"created_file": bool, "added_key": bool}): take
+    them over once, so sync goes on and --remove still knows what is ours."""
+    old, rec_path = flag(state, "zed-config-installed"), flag(state, "zed-config.json")
+    if not has(old):
+        return
+    try:
+        with open(rec_path, encoding="utf-8") as f:
+            rec = json.load(f)
+    except (OSError, ValueError):
+        rec = {}
+    rec = rec if isinstance(rec, dict) else {}
+    setflag(flag(state, "settings-installed"), True)
+    if rec.get("created_file"):
+        setflag(flag(state, "settings-created"), True)
+    if rec.get("added_key"):
+        setflag(flag(state, "settings-key-added"), True)
+    setflag(rec_path, False)
+    setflag(old, False)
+
+
 def doctor(a, hosts):
     """CHECK<TAB>LEVEL<TAB>MESSAGE[<TAB>FIX] rows for `TOOL doctor`."""
     def row(check, level, msg, fix=""):
@@ -576,6 +633,7 @@ def main():
     a = ap.parse_args()
     HOST_PREFIX = a.prefix
 
+    take_over_old_state(a.state)
     if a.doctor is not None:
         return doctor(a, [h for h in a.doctor if NAME_RE.match(h)])
     # no --sync: the live list is unknown (min ls failed); keep our entries
@@ -591,8 +649,8 @@ def main():
     # Every file is planned before any is written: one that does not parse stops all.
     plans = []
     for what, path in files:
-        exists, text, bom = read(path)
         try:
+            exists, text, bom = read(path)
             current = load_jsonc(text)
             if what == "settings":
                 if current is not None and not isinstance(current, dict):

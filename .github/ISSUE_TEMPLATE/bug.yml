@@ -30,4 +30,7 @@ body:
       label: What happened
       description: >-
         What you ran, what Zed showed, and what you expected. `~/.local/state/min-zed/proxy.log`
-        (one line per connection) and `watch.log` often help; `min-zed ssh NAME -- -v true` shows the transport.
+        (one line per connection) and Zed's log (`zed: open log` in the command palette) often help;
+        `min-zed ssh NAME -- -v true` shows the transport.
+    validations:
+      required: true
