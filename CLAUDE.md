@@ -1,150 +1,186 @@
 # CLAUDE.md
 
-`min-zed` opens Minimal sessions (`min`, libkrun microVMs) as Zed ssh remote
-projects (`zed ssh://min-zed.NAME/workbench`), with sshd running inside the
-box behind a `min session exec` ProxyCommand. One POSIX shell script plus a
-python3 settings merger, no build step. Split from noric-labs/minx; one of
-the min-<client> repos (plan of record:
-`~/.claude/plans/we-are-going-to-fancy-sloth.md`, kernel contract:
-`~/code/min-clients/KERNEL.md`).
+`min-zed` opens Minimal boxes (`min` sessions, libkrun microVMs) in Zed as ssh
+remote projects (`zed ssh://min-zed.NAME/workbench`), with sshd running inside
+the box behind a `min session exec` ProxyCommand. One POSIX shell script plus
+a python3 merger, no build step. It is the Zed twin of min-vscode
+([norrietaylor/vscode](https://github.com/norrietaylor/vscode)): same plumbing
+and commands; only the editor-specific constants, the merger and the loadout
+differ. There is no Zed extension (Zed's WASM API has no UI): the UI is Zed's
+own surfaces, which `setup` wires: the Remote Projects list
+(`ssh_connections`), global tasks, and one key.
 
 ## Layout
 
 | File | Role |
 |---|---|
-| `bin/min-zed` | constants (`TOOL CLIENT LOADOUT HOST_PREFIX ENV_PREFIX STATE`), then the vendored kernel block, then the Zed layer: `open new attach destroy gc status doctor watch zed-config completions`; kernel commands `ssh ssh-config _proxy` |
-| `bin/min-zed` kernel | between `# --- kernel begin (vendored from norrietaylor/cmux; keep in sync) ---` and `# --- kernel end ---`: transport, PREP/`prepare`, stanzas, naming, `destroy_one`, `box_in_use`, `track_orphans`, report helpers. Byte-identical across repos, pinned by `tests/kernel.sha`; client-free (no Zed code) |
-| `bin/min-zed-config` | python3: keeps `ssh_connections` entries whose host starts `min-zed.` in Zed's `settings.json` equal to the live sessions (JSONC text edit, backup, no-op when unchanged, `--remove`, `--doctor`, `--dry-run`) |
-| `loadouts/zed.toml` | Minimal loadout `zed`: `openssh curl jq rsync xxhash`; sshd env + `min:workbench` rc line; Claude hook `~/.claude/min-zed-hook.sh` writing `/home/.min-zed/agent-state` |
-| `justfile` | `check install loadout uninstall ssh-config zed-config kernel-sha` |
-| `tests/run.sh`, `tests/stubs/`, `tests/kernel.sha`, `tests/kernel-sha.sh` | plain-sh tests over stub `min zed ssh ssh-keygen ps osascript herdr curl` (+ `find`/`mv` for PREP races); a second pass with a long `HOST_PREFIX`; two-tool ssh-config coexistence in all four install/remove orders |
-| `README.md`, `docs/` | `zed.md` (guide), `commands.md`, `configuration.md`, `how-it-works.md`, `security.md`, `troubleshooting.md`, `spike.md` (Z1, E1, K1), `manual-test-plan.md` |
-| `docs/public/` | `min-zed-mark-{dark,light}.svg` (Minimal glyph + "zed", text not outlined), `built-with-minimal.svg` |
-| `CHANGELOG.md`, `LICENSE`, `.github/ISSUE_TEMPLATE/` | Keep a Changelog, Apache-2.0, bug template asking for `doctor` output |
+| `bin/min-zed` | tool constants, then the transport/ssh/session plumbing, then the client layer, whose first block holds every editor-specific constant |
+| plumbing | transport, PREP/prepare, `stored_path`, ssh options and stanzas, `ssh-config`, `_proxy`, `ssh`, naming, `pick_session`, `activate_session`, `destroy_one`, `in_use_names`/`box_in_use`, `track_orphans`, `default_loadouts`, the ssh-config record, report helpers; editor-neutral, reaching the client layer only through its hooks |
+| client layer | `open`/`new`/`attach` (session, stanza, settings, `zed ssh://…` unless `--no-window`; `new --empty`), `destroy` (`--if-idle`; no NAME: the cwd's own box, else on a terminal the picker), `gc`, `status` (`--json`), `doctor`, `completions`, `config` (alias `zed-config`), `setup`, hidden `_sessions`; hooks `client_on_connect` and `client_on_destroy` (settings sync) |
+| `bin/min-zed-config` | python3 merger for three JSONC files in `~/.config/zed`: `settings.json` (`ssh_connections` entries for live sessions, edited in place), `tasks.json` and `keymap.json` (a marked block at the top of the array: the Minimal tasks, the local-terminal key); `--install`, `--sync NAME...`, `--remove`, `--doctor`, `--dry-run` |
+| `loadouts/zed.toml`, `loadouts/zed/` | `openssh curl rsync xxhash git`; sshd env prep; `min:workbench` rc line; a patch copying `zed/skills/minimal-sandbox` to `~/.claude/skills` in the box. `setup` copies `zed/` beside the linked toml: `$LOADOUT_ROOT` must be a real directory |
+| `skills/`, `loadouts/zed/skills/` | Minimal's skills, vendored from gominimal/minimal-skills (MIT) at a pinned commit by `just skills`: the host ones (`setup` copies them into the Mac's `~/.agents/skills` (Zed's agent) and `~/.claude/skills`, marked `.min-zed-copy`, never over an unmarked dir) and `minimal-sandbox` (box only: the host ones teach commands a box lacks) |
+| `minimal.toml` | developing this repo in a box: session packages for `just check`; task `check` (`min task run check`) |
+| `justfile` | `check`, `install`/`uninstall` (= `setup`), `ssh-config`, `zed-config`, `skills` |
+| `tests/run.sh`, `tests/stubs/` | plain-sh tests over stub `min`, `zed`, `ssh`, `ssh-keygen`, `ps` (+ `find`/`mv` for PREP races) and a `tripwire` for bare GUI commands; `LONG_PREFIX=1` reruns them with a long host prefix; the destroy picker runs on a pty through `script(1)` (skipped without it) |
+| `docs/` | user docs (being rewritten for 0.2.0), `public/` marks and badge |
+
+## The Zed UI (what `config` writes)
+
+- One `ssh_connections` entry per live own session,
+  `{"host": "min-zed.NAME", "nickname": "NAME", "projects": [{"paths": ["/workbench"]}]}`:
+  the Remote Projects modal (`ctrl-cmd-o`), reloaded live.
+- `tasks.json` block, seven tasks: `Minimal: New Box from Folder` (`new .`,
+  `cwd` `$ZED_WORKTREE_ROOT`, so not offered with no folder open),
+  `Minimal: New Empty Box` (`new --empty`), `Minimal: Open Box…` (`attach`:
+  picker), `Minimal: Destroy Box…` (`destroy`: the cwd's box, else picker),
+  `Minimal: Clean Up Idle Boxes…` (`gc`), `Minimal: Status`,
+  `Minimal: Doctor`. Each runs through `"shell": {"program": "sh"}` (any
+  login shell) and calls `$HOME/.local/bin/min-zed` by absolute path; where
+  that is missing (a box window: global tasks run in the box) it prints one
+  line pointing at a local window or the local-terminal key, and exits 1.
+  The CLI's own y/N questions and numbered pickers are the UI.
+  `reveal: always`, `use_new_terminal: false`, `allow_concurrent_runs:
+  false`, `show_command: false`; `hide: on_success` for the three that open
+  a window, `never` for the rest. No `$ZED_*` variable in a command: Zed
+  pastes them in unquoted.
+- `keymap.json` block: `` ctrl-alt-` `` → `["workspace::NewTerminal", {"local": true}]`
+  in context `Workspace`: a Mac terminal from a box window. Free in Zed
+  1.26.2's default macOS keymap, beside `` ctrl-` `` (terminal panel) and
+  `ctrl-~` (new terminal). No task bindings: `cmd-shift-r`, then "Minimal".
 
 ## Invariants
 
-- Session names are `<dir>-<word>` (`next_name`: first free word, never a
-  live name) unless `-n` is given, and match `^[a-z0-9][a-z0-9-]*$`, `-n`
-  included: they are hostnames and ssh `Host` patterns.
+- Session names match `^[a-z0-9][a-z0-9-]*$`, `-n` included: they are
+  hostnames and ssh `Host` patterns. Without `-n`, min names the session;
+  `activate_session` takes the one new session for the path and refuses a
+  name that is no hostname.
+- Host alias is `min-zed.NAME` (`HOST_PREFIX`); nothing hard-codes the
+  prefix length (the long-prefix test run guards it).
 - `prepare` re-pins the host key and re-pushes the public key on every
-  `open`/`new`/`attach`/`ssh`/`_proxy`, so a recreated session or a rotated
-  key self-heals for every client. `_proxy` always runs `prepare` and writes
-  nothing to stdout before `exec` (stdout is the SSH byte stream).
+  `open`/`attach`/`ssh`/`_proxy`, so a recreated session self-heals.
+  `_proxy` always runs `prepare` and writes nothing to stdout before `exec`
+  (stdout is the SSH byte stream). `_proxy` and `prepare` never call client
+  hooks, never touch Zed's files.
 - `ssh-config` is an opt-in gate: nothing under `~/.ssh` is touched until it
-  has run (`open`/`new`/`attach` refuse until then). Once installed,
-  `min-zed.conf` is rewritten only by `prepare` and `destroy_one`, and only
-  when its content changed. `ssh-config --remove` leaves `~/.ssh/config`
-  byte-identical to before install; `--print` writes nothing.
-- `zed-config` is the second opt-in gate: Zed's settings are untouched until
-  it has run (`$STATE/zed-config-installed`). Then `client_on_connect`
-  (open/new/attach/ssh) and `client_on_destroy` resync; `_proxy` never does.
-  Only entries whose host starts `min-zed.` are added or removed; an existing
-  entry of ours is kept verbatim; every other byte (comments between
-  entries, CRLF, BOM) stays; no write when the parsed result is unchanged;
-  dated backup in `$STATE/backups` before every write; one rename of a temp
-  file beside the realpath (symlinks survive). `--remove` drops the key only
-  if we added it and the file only if we created it and it is empty again
-  (`$STATE/zed-config.json`).
+  has run. `ssh-config --remove` leaves `~/.ssh/config` byte-identical to
+  before install; `--print` writes nothing. Other tools' Include lines are
+  never touched.
+- `config` is the same kind of gate for Zed's files: `--sync` is a no-op
+  until `config` has run (`STATE/settings-installed`), and `--sync` (from
+  open/attach/ssh/destroy/gc) touches only `ssh_connections`; only `config`
+  (`--install`, also run by `setup`) writes the tasks and keymap blocks.
+  Settings: only entries whose host starts with the prefix are added or
+  removed; an existing entry of ours is kept verbatim; every other byte
+  (comments between entries, CRLF, BOM) stays; the key is removed only if we
+  added it (`STATE/settings-key-added`). Tasks/keymap: the block between
+  `// min-zed:begin` and `// min-zed:end` right after the array's `[` is
+  ours and rewritten whole (Zed's keymap editor appends after it); a file
+  with no array gets one marked `// min-zed:array`, taken out with the block
+  while nothing else went into it. For all three: dated backup in
+  `STATE/backups/` before a write; written through a symlink, replaced
+  atomically; never written when unchanged; `--remove` restores the bytes it
+  found and deletes a file it created (`STATE/<file>-created`) once empty; a
+  file that does not parse (or has the wrong top level) is refused, and then
+  none of the three is written. Settings sync is skipped when `min ls` fails.
 - The host key is pinned (`StrictHostKeyChecking=yes`); never `accept-new`.
 - Agent and X11 forwarding stay off on every client path: one option list
   (`ssh_common`) feeds both the stanza and `ssh_opts`.
 - Facts the box reports (user, hostkey, home, sshd) are untrusted: `prepare`
-  validates them before writing anything, and stored ones are re-checked on
-  read. The agent-state line is read with `head -c 512` in the box and on the
-  host, under `with_timeout` (which backgrounds `$MIN` itself, never a shell
-  function), validated (allowlisted state word, epoch digits without a
-  leading zero, at most 12), cleaned (controls, bidi, U+2028/9; 200
-  characters) and reaches `osascript` only as argv.
+  validates them before writing anything, and dies if a write fails; stored
+  `home`/`sshd` are re-checked on read (`stored_path`) by `_proxy` and by the
+  ProxyCommand `ssh` builds.
 - `gc` and `destroy` never destroy without an explicit y; `-y` is the only
-  way past `destroy`'s prompt. `gc` offers only sessions min-zed prepared
-  (`$STATE/sessions/NAME`), never another tool's.
-- A session with a host process running `session exec NAME … sshd` (any
-  tool) is in use; under Herdr's `remote-client-bridge` only while Herdr lists
-  an agent (cached a minute). Never contact a box without such a live
-  process: a connect starts a stopped box. The watch polls only in-use boxes.
-- The watch notifies only on a change to `needs-input` or `finished`
-  (cache `$STATE/cache/NAME.agent`); a stale state seen first is cached
-  silently; at most one notification per box per minute. One watch per state
-  dir (`watch.lock` + `watch.pid`; a pid is ours only if `ps` shows a
-  `min-zed watch`; the loop leaves when the pid file is not its own), stopped
-  by PID. `watch --ensure` reports success only once the watch runs.
-  `watch.log` is trimmed like `proxy.log`.
-- `gc` calls the kernel's `gc_still_idle NAME` right before each question.
-- Server pre-fetch runs only from `open`/`new` on a fresh session, only with
-  `MIN_ZED_PREFETCH=1`, fully detached in the box (`setsid nohup … &`, all
-  streams `/dev/null`); never from `prepare` or `_proxy`.
-- In the box: host key `~/.ssh/minx/host_ed25519` shared by every
-  min-<client> tool under one lock protocol; `authorized_keys` per tool in
-  `~/.ssh/min-zed/`; `~/.ssh/environment` shared; one `/workbench` rc line
-  (`minx:workbench` or `min:workbench` counts); the loadout's jq merge removes
-  only `min-zed-hook` entries.
-- Install never edits `config.toml`; `activate_session` passes the user's
-  `default_loadouts`, then `--loadout zed` last. `just uninstall` removes only
-  its own symlinks and never restores a `.bak`.
-- `~/.ssh` coexistence: each tool has its own Include pair and `TOOL.conf`;
-  what the first install created is in the shared
-  `${XDG_STATE_HOME:-~/.local/state}/min-clients/ssh-config-created`, deleted
-  (with what it lists, if empty) by whichever tool removes the last Include.
-- Tests set `MIN_NO_PATH_EXTEND=1`, unset `ZDOTDIR VISUAL EDITOR`, put
-  tripwire stubs on PATH for `open osascript zed code cursor windsurf herdr
-  curl` (a call fails the case), and reach the real stubs only by absolute
-  `*_BIN` paths in `$T/stub-bin` (`case_tests_use_absolute_tool_paths`
-  checks). Never point a test at a bare program name.
-
-## Kernel
-
-Do not edit the kernel block here: it is the frozen cmux block
-(`~/code/min-clients/cmux/bin/min-cmux` lines 25–759 at cmux `0e89793`, kernel v2, sha `724b7471…c1ba`, "As built" in
-`~/code/min-clients/KERNEL.md`), byte for byte. Changes go into the cmux
-repo first, then are copied into every repo, then `just kernel-sha`.
-`tests/run.sh` checks the pin and that the block mentions neither Zed nor
-osascript. The kernel defines no hook defaults: `hook NAME` calls a
-`client_*` function only when the client layer defines it.
+  way past `destroy`'s question.
+- `gc` offers only own sessions (`own_ls`: a key dir `STATE/sessions/NAME`),
+  and `gc`/`status` date only those in `orphan/` (`track_orphans`, each run);
+  boxes made by `min` alone are never listed. The same holds wherever a
+  session is chosen for the user: `open`'s reuse of a live session for PATH,
+  `destroy`'s cwd lookup and its picker, the `attach` picker and `_sessions`
+  (completions). Only an explicit NAME (`attach NAME`, `destroy NAME`,
+  `open -n NAME`) may reach another tool's box.
+- `destroy` without NAME: exactly one own session for the cwd is it;
+  otherwise, on a terminal (a Zed task), the own-session picker; without a
+  terminal, or with no own session at all, the errors ("no session for DIR;
+  pass NAME", "several sessions for DIR: …; pass NAME").
+- In use = some host process runs `min session exec NAME ... sshd` (any ssh
+  client's connection). Never contact a box without such a live process: a
+  connect starts a stopped box.
+- `gc` re-checks `gc_still_idle` before each question; `destroy --if-idle`
+  re-checks it too (exit 3 when in use); without a terminal, unsaved changes
+  exit 4 and only `destroy -y --force` discards them.
+- Activation passes the user's `default_loadouts` on before `--loadout zed`.
+- What `ssh-config` created under `~/.ssh` is recorded in
+  `~/.local/state/min-clients/ssh-config-created`; removing the last
+  `Include ~/.ssh/min-*.conf` deletes only that, so `~/.ssh/config` ends
+  byte-identical.
+- Install never edits `default_loadouts`; `setup --remove` (`just uninstall`)
+  removes only our own links, marked skill copies, Zed entries and blocks,
+  and Include. `setup` replaces a link only when missing, dangling, or
+  pointing to another copy of the same file (a moved checkout); stanzas bake
+  the `~/.local/bin` link, so it follows the checkout.
 
 ## External facts that bite
 
 - `min` is a zsh function on the host; `MIN_BIN` is resolved to an absolute
-  path and baked into each stanza. GUI apps (Zed) spawn `ssh` with the
-  launchd PATH and no shell rc.
-- ssh runs the ProxyCommand via `$SHELL -c "exec …"` and expands `%` tokens:
-  every word goes through `shq` and the whole string through `pct`; `env
-  VAR=… cmd`, not a `VAR=x cmd` prefix (tcsh, old fish).
-- OpenSSH reads `UserKnownHostsFile` only after the server banner, which is
-  why `_proxy` may re-pin the key before exec'ing sshd.
-- The box is uid 1000 with `$HOME=/home`; its passwd name follows the SSH
-  username of the connection that launched the session host, so `user` is
-  read on every `prepare`.
-- sshd scrubs the environment: `PermitUserEnvironment=yes` +
-  `~/.ssh/environment`, with `PROMPT_COMMAND`/`MINIMAL_MOTD` filtered out.
-- `min session activate --loadout X` makes min ignore `default_loadouts`
-  (hence `activate_session` passes them on).
-- Zed 1.22 (2026-10-02, via minx): `zed ssh://HOST/PATH` reads
-  `~/.ssh/config`; Zed runs its own ControlMaster and downloads
-  `zed-remote-server-linux-<arch>` inside the box with curl into
-  `/home/.zed_server`. `zed --version` prints `Zed 1.22.0 – /Applications/Zed.app`.
-- The kernel appends `/opt/homebrew/bin` to PATH, so a test that unsets a
-  stub by name (`ZED_BIN=zed`) reaches the real binary: use a nonexistent
-  absolute path instead.
+  path and baked into each stanza (Zed spawns ssh with the launchd PATH).
+- Without `zed` on PATH, `bin/min-zed` uses the app's own CLI
+  (`$MIN_ZED_EDITOR_APP/Contents/MacOS/cli`, default `/Applications/Zed.app`);
+  `MIN_ZED_EDITOR_BIN` overrides both. `zed --version` prints
+  `Zed 1.26.2 – /Applications/Zed.app`; doctor notes a version other than
+  the tested 1.26.2.
+- `bin/min-zed` appends `/opt/homebrew/bin`, `/usr/local/bin` and
+  `~/.local/bin` to PATH (unless `MIN_NO_PATH_EXTEND=1`, which tests set,
+  with `ZDOTDIR VISUAL EDITOR` unset), where the real `zed` lives: tests must
+  point `MIN_ZED_EDITOR_BIN` (and every other `*_BIN`) at an absolute stub
+  path, never a bare name. Bare `open`, `osascript`, `zed`, `code`, `cursor`
+  and `windsurf` on the test PATH are `tests/stubs/tripwire` (stubs live in
+  `$T/stub-bin`), and any tripwire line fails the case. A mutation check
+  never removes or bypasses a stub or the tripwire; skip any that could
+  launch a real app.
+- ssh runs the ProxyCommand via `$SHELL -c "exec ..."` and expands `%`
+  tokens: every word goes through `shq` and the whole string through `pct`.
+- Zed 1.26.2, seen live 2026-10-29: `ssh_connections` entries appear in
+  Remote Projects and reload live; global `~/.config/zed/tasks.json` tasks
+  run on the Mac in a local window and in the box (bash, cwd `/workbench`)
+  in a box window; `["workspace::NewTerminal", {"local": true}]` opens a Mac
+  terminal from a box window; a new box host opens in Restricted Mode until
+  trusted once; agent notifications fire for box threads.
+- Zed task commands go through `shellexpand` (Zed source, v1.26.2): `$ZED_*`
+  variables are pasted into the command text unquoted, a task whose
+  `$ZED_*` variable is unset is not offered, other `$VARS` are left to the
+  shell. Tasks run in an interactive terminal (`sh -i -c`), so `[ -t 0 ]`
+  holds.
+- Zed downloads its remote server into the box itself:
+  `~/.zed_server/zed-remote-server-stable-<ver>+stable.<build>.<sha>`.
+  Claude Agent (ACP) runs in the box with the Node Zed downloads
+  (`~/.local/share/zed/node`; the loadout needs none) and reads
+  `~/.claude/skills` there; Zed's own agent runs on the Mac and reads
+  `~/.agents/skills/<skill>/SKILL.md`.
+- The box is uid 1000 with `$HOME=/home`, aarch64, glibc 2.44, has bash, tar,
+  curl, python3, zsh; `sshd` at `/usr/sbin/sshd`.
+- sshd scrubs the environment: PREP writes `~/.ssh/environment` (filtering
+  `PROMPT_COMMAND`/`MINIMAL_MOTD`) and sshd runs with `PermitUserEnvironment=yes`.
+- In the box, the host key and `authorized_keys` live in `~/.ssh/min-zed/`.
+- Without a terminal, `min session destroy` refuses a box with unsaved
+  changes ("refusing to destroy the session without confirmation; pass
+  --force").
 
 ## Working here
 
-- Verify: `just check` (shellcheck on `bin/min-zed`, `tests/run.sh` and the
-  stubs; `py_compile` on `bin/min-zed-config`; the tests).
-- Tests never touch the real min, Zed, `~/.ssh` or Zed settings: stubs first
-  on a private PATH, `HOME`, `MIN_ZED_STATE_DIR` and `MIN_ZED_SETTINGS` in a
-  tempdir; guards fail a case that writes `~/.ssh` or settings without
-  opting in.
-- Don't create, attach or destroy min sessions, `min session exec` into one,
-  or run `zed` against a real host, without asking.
-- `just install`/`just loadout` edit the real `~/.config/minimal` and
-  `~/.ssh`; exercise them with `HOME` and `XDG_CONFIG_HOME` pointed at a
-  scratch dir. Don't run `ssh-config`, `zed-config` or `_proxy` by hand from
-  this shell; `--print` is the read-only way to look.
-- A `watch` started for a smoke test must be stopped by PID.
+- Verify: `just check`.
+- Tests never touch the real min, Zed, `~/.ssh` or `~/.config`: stubs first
+  on a private PATH, `HOME`, `MIN_ZED_STATE_DIR`, `MIN_ZED_SETTINGS`,
+  `MIN_ZED_TASKS` and `MIN_ZED_KEYMAP` in a tempdir.
+- Don't create, attach or destroy min sessions, or `min session exec` into
+  one, without asking. Don't run `ssh-config`, `config`, `_proxy`,
+  `just install`/`uninstall` against the real HOME; use `HOME=<scratch>`
+  `XDG_CONFIG_HOME=<scratch>` and a stub `MIN_BIN`.
 
 ## Unverified (needs a live session)
 
-Recorded in `docs/spike.md`: Z1 (server pre-fetch naming/URL; gates
-`MIN_ZED_PREFETCH`), E1 (agent-state hook → file → watch → notification with
-Zed connected; Claude via Zed's agent panel), K1 (two tools on one box).
+- The Minimal tasks end to end in Zed: `sh` as the task shell, the
+  `$ZED_WORKTREE_ROOT` cwd, `hide: on_success` after a window opens, the
+  pickers and y/N answered in a task terminal, the box-window guard line.
+- `` ctrl-alt-` `` reaching `workspace::NewTerminal` (no OS or layout grab).
+- Destroying the box a window is on closes that remote connection.

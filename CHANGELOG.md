@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - unreleased
+
+Rebuilt as the Zed twin of min-vscode 0.2.0: its plumbing, commands and
+loadout, with Zed's own surfaces as the UI (Remote Projects via
+`ssh_connections`, the Minimal tasks in `tasks.json`, a local-terminal key in
+`keymap.json`, all written by `min-zed setup`/`config`). `watch`, the
+in-box Claude hook, the server pre-fetch, Herdr support and `<dir>-<word>`
+naming are gone. (Details to follow.)
+
 ## [0.1.0] - 2026-10-16
 
 First release, split from [minx](https://github.com/noric-labs/minx).

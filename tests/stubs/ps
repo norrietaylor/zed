@@ -1,5 +1,5 @@
 #!/bin/sh
-# Stub for ps: the process list (PID PPID ARGS lines) the kernel scans for
+# Stub for ps: the process list (PID PPID ARGS lines) in_use_names scans for
 # boxes in use is $FIXTURES/ps.txt; any other query goes to the real ps.
 # With $FIXTURES/ps.later.txt, every scan after the first serves that instead.
 if [ "$*" = "-xo pid=,ppid=,args=" ]; then

@@ -10,35 +10,29 @@ for a in "$@"; do
 done
 echo "$line" >> "$STUB_LOG"
 case "${1:-} ${2:-}" in
-    "version ") printf 'Client: minimal %s\nServer: minimald 0.6.0\n' "${STUB_MIN_VERSION:-0.6.0}" ;;
+    "version "*) printf 'Client: minimal %s\nServer: minimald 0.7.0\n' "${STUB_MIN_VERSION:-0.7.0}" ;;
     "loadout list") cat "$FIXTURES/loadouts.txt" 2>/dev/null ;;
     "ls --json") cat "$FIXTURES/sessions.json" ;;
     "session activate")
         [ -f "$FIXTURES/sessions.after.json" ] && cp "$FIXTURES/sessions.after.json" "$FIXTURES/sessions.json"
         exit 0 ;;
     "session exec")
-        # prepare:  min session exec NAME sh -c PREP min-zed PUBKEY
-        # prefetch: min session exec NAME sh -c LAUNCH min-zed FETCH VERSION (logged only)
-        # poll:     min session exec NAME head -c 512 PATH -> $FIXTURES/agent-state.NAME
+        # prepare: min session exec NAME sh -c PREP TOOL PUBKEY
         # anything else (the _proxy sshd argv): echo it, as the ssh byte stream
-        if [ "${4:-}" = sh ] && [ $# -ge 9 ]; then
-            exit 0
-        elif [ "${4:-}" = sh ]; then
+        if [ "${4:-}" = sh ]; then
             printf '%s' "$8" > "$STUB_LOG.pubkey"
             [ ! -f "$FIXTURES/exec.hook" ] || sh "$FIXTURES/exec.hook"   # e.g. a session appears meanwhile
             cat "$FIXTURES/facts.txt"
-        elif [ "${4:-}" = head ]; then
-            # $FIXTURES/exec.hang.NAME: the box never answers (one process, like min)
-            [ ! -f "$FIXTURES/exec.hang.$3" ] || exec sleep 30
-            # $FIXTURES/exec.stream.NAME: a box that ignores `head -c` and streams one endless line
-            if [ -f "$FIXTURES/exec.stream.$3" ]; then { cat "$FIXTURES/agent-state.$3"; yes A; } | tr -d '\n'; exit 0; fi
-            cat "$FIXTURES/agent-state.$3" 2>/dev/null
         else
             printf 'sshd-stub'; printf ' [%s]' "$@"; echo
         fi ;;
     "session destroy")
         rc=0
         [ -f "$FIXTURES/destroy.rc" ] && rc=$(cat "$FIXTURES/destroy.rc")
+        # destroy.needs-force: unsaved changes and no terminal, as min says it
+        if [ -f "$FIXTURES/destroy.needs-force" ] && [ "${4:-}" != --force ]; then
+            echo "error: refusing to destroy the session without confirmation; pass --force" >&2; exit 1
+        fi
         if [ "$rc" = 0 ]; then
             jq --arg n "$3" '.sessions |= map(select(.name != $n))' "$FIXTURES/sessions.json" > "$FIXTURES/sessions.tmp" \
                 && mv "$FIXTURES/sessions.tmp" "$FIXTURES/sessions.json"

@@ -1,0 +1,24 @@
+# Minimal config for developing min-zed in a box.
+
+[upstream] # Source of software & tooling
+repo = "https://github.com/gominimal/pkgs"
+branch = "main"
+locked_commit = "aec0d376947eec2272a67ee4cf7cad832bacb7a1"
+
+[defaults]
+state_key = "dev"
+
+# A dev session has what `just check` needs: the CLI and its tests (POSIX sh,
+# shellcheck, jq, ssh, ps, bash and zsh for the completion parse checks) and
+# the merger (python). The destroy picker test needs script(1) and skips
+# without it.
+[session]
+packages = [
+  "base", "git", "vim",
+  "just", "shellcheck", "jq", "python", "openssh", "procps-ng", "bash", "zsh",
+]
+
+# min task run check: the whole suite.
+[tasks.check]
+packages = ["base", "just", "shellcheck", "jq", "python", "openssh", "procps-ng", "bash", "zsh"]
+bash = "just check"

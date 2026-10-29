@@ -1,42 +1,114 @@
 #!/usr/bin/env python3
-"""Keep min-zed's ssh_connections entries in Zed's settings.json in step with live sessions.
+"""Keep min-zed's wiring in Zed's settings.json, tasks.json and keymap.json.
 
-Usage: min-zed-config [--settings PATH] [--backup-dir DIR] [--dry-run|--remove|--doctor] [NAME...]
+All three are JSONC (comments, trailing commas) that people edit by hand and
+Zed edits itself, so none is ever rewritten from a parsed object: every edit
+is textual, and every byte that is not ours stays.
 
-The NAMEs are the live min-zed sessions. Afterwards the settings hold exactly
-one `ssh_connections` entry per NAME whose host is `min-zed.NAME`; entries
-whose host does not start with `min-zed.` are never touched, and an entry of
-ours that already exists is kept as written (so a hand-added option such as
-`upload_binary_over_ssh` survives).
+  * settings.json: the `ssh_connections` entries whose host starts with our
+    prefix are made exactly the live sessions, one
+    `{"host": "min-zed.NAME", "nickname": "NAME", "projects":
+    [{"paths": ["/workbench"]}]}` per session: Zed's Remote Projects list
+    (it reloads live). Entries of anyone else are never touched; an entry of
+    ours that already exists is kept as written (a hand-added
+    `upload_binary_over_ssh` survives); comments between entries stay. Our
+    unwanted entries are deleted and missing ones appended inside the array,
+    or the key is spliced in after the opening brace, and taken out again
+    only if we added it (STATE/settings-key-added). `--sync NAME...` (from
+    open, attach, ssh, destroy, gc) touches only this file.
+  * tasks.json and keymap.json: top-level arrays, which get a marked block
+    right after the opening bracket, between `// min-zed:begin` and
+    `// min-zed:end` lines: the Minimal tasks (each runs
+    ~/.local/bin/min-zed in a terminal, whose own questions and pickers are
+    the UI) and the key that opens a terminal on the Mac from a box window.
+    The block is ours and rewritten whole; everything around it is the
+    user's (Zed's keymap editor appends after it). A file without an array
+    gets one, marked `// min-zed:array`, taken out again with the block
+    while nothing else went into it. Only `--install` writes these blocks.
 
-settings.json is JSONC (comments, trailing commas). Like minx-config, this
-edits text, not a re-serialised object, so the user's comments and layout
-stay: it parses leniently to learn the structure, then deletes our unwanted
-entries and appends missing ones inside the `ssh_connections` array, leaving
-every other byte (other entries, comments between them, CRLF line ends) as
-it was; or splices a new key in after the opening brace. The key is removed
-again only if we added it (`--record`), and a settings file we created is
-deleted by `--remove` once nothing is left in it. Writes go to a temp file
-beside the real file and replace it in one rename (a dotfiles symlink stays a
-symlink), after a dated backup, and never when the effective settings would
-not change.
+`--sync` is a no-op until `--install` has run (the opt-in record is
+STATE/settings-installed); `--remove` takes everything of ours out again,
+byte for byte, and deletes a file we created once nothing is left in it
+(STATE/<settings|tasks|keymap>-created). Before a write the old file is
+copied to STATE/backups/<file>.<time>; the file is written through a symlink
+(dotfiles) and replaced atomically; a file whose result is unchanged is never
+written. A file that does not parse is refused, and then none is written.
 """
 import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
 
-PREFIX = "min-zed."
-NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# ---- client constants ----
+TOOL = "min-zed"
+HOST_PREFIX = "min-zed."
+EDITOR_NAME = "Zed"
+ZED_DIR = os.path.expanduser("~/.config/zed")
+SETTINGS_DEFAULT = os.path.join(ZED_DIR, "settings.json")
+TASKS_DEFAULT = os.path.join(ZED_DIR, "tasks.json")
+KEYMAP_DEFAULT = os.path.join(ZED_DIR, "keymap.json")
+ENV_SETTINGS = "MIN_ZED_SETTINGS"
+ENV_TASKS = "MIN_ZED_TASKS"
+ENV_KEYMAP = "MIN_ZED_KEYMAP"
+ENV_STATE = "MIN_ZED_STATE_DIR"
 KEY = "ssh_connections"
-KEEP_BACKUPS = 20
+WORKDIR = "/workbench"
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
+BEGIN = f"// {TOOL}:begin"
+END = f"// {TOOL}:end"
+# On the END line when the opening bracket was not followed by a line break:
+# --remove then takes the break it added after the bracket out too.
+JOINED = "(joined)"
+# On the `[` line of an array we added to a file that had none.
+ARRAY = f"// {TOOL}:array"
+
+# The key that opens a terminal on the Mac from any window (a box window's
+# own terminals are in the box). Free in Zed 1.26.2's default macOS keymap,
+# beside ctrl-` (terminal panel) and ctrl-~ (new terminal).
+LOCAL_TERMINAL_KEY = "ctrl-alt-`"
+KEYMAP = [
+    {"context": "Workspace", "bindings": {LOCAL_TERMINAL_KEY: ["workspace::NewTerminal", {"local": True}]}},
+]
+
+
+def task(label, args, hide="never", cwd=None):
+    """A Zed task running `TOOL ARGS` in a terminal, through sh whatever the
+    login shell is. A global task runs in the box in a box window, where the
+    CLI is missing: there it says where to run it instead."""
+    cmd = (f'm="$HOME/.local/bin/{TOOL}"; [ ! -x "$m" ] || exec "$m" {args}; '
+           f'echo "{TOOL}: $m not found."\' In a box window, run Minimal tasks from a local window '
+           f'or a Mac terminal ({LOCAL_TERMINAL_KEY}); on the Mac, run {TOOL} setup.\'; exit 1')
+    t = {"label": label, "command": cmd}
+    if cwd:
+        t["cwd"] = cwd
+    t.update({"use_new_terminal": False, "allow_concurrent_runs": False, "reveal": "always",
+              "hide": hide, "shell": {"program": "sh"}, "show_command": False})
+    return t
+
+
+# A task that opens a window hides its terminal once it did (on_success);
+# the others leave theirs to be read. "New Box from Folder" names its folder
+# through cwd: with no folder open the variable is unset and Zed hides it.
+TASKS = [
+    task("Minimal: New Box from Folder", "new .", "on_success", "$ZED_WORKTREE_ROOT"),
+    task("Minimal: New Empty Box", "new --empty", "on_success"),
+    task("Minimal: Open Box…", "attach", "on_success"),
+    task("Minimal: Destroy Box…", "destroy"),
+    task("Minimal: Clean Up Idle Boxes…", "gc"),
+    task("Minimal: Status", "status"),
+    task("Minimal: Doctor", "doctor"),
+]
+
+
+# ---- JSONC ----
 
 def strip_jsonc(text, trailing=True):
-    """Return text with // and /* */ comments and trailing commas blanked.
+    """Return text with // and /* */ comments (and trailing commas) blanked.
 
     Every other byte keeps its offset (comments become spaces, newlines stay),
     so positions found in the result are valid in the original text.
@@ -88,8 +160,9 @@ def strip_jsonc(text, trailing=True):
 
 
 def load_jsonc(text):
-    s = strip_jsonc(text[1:] if text.startswith("\ufeff") else text)
-    return (json.loads(s) if s.strip() else {}), s
+    """The parsed value, or None for a file of only whitespace and comments."""
+    s = strip_jsonc(text)
+    return json.loads(s) if s.strip() else None
 
 
 def skip_value(s, i):
@@ -126,6 +199,8 @@ def ws(s, i):
     return i
 
 
+# ---- settings.json: ssh_connections ----
+
 def top_members(s):
     """[(key, key_start, value_start, value_end)] of the top-level object, and its brace index."""
     brace = ws(s, 0)
@@ -160,11 +235,11 @@ def elements(s, start, end):
 
 
 def ours(entry):
-    return isinstance(entry, dict) and isinstance(entry.get("host"), str) and entry["host"].startswith(PREFIX)
+    return isinstance(entry, dict) and isinstance(entry.get("host"), str) and entry["host"].startswith(HOST_PREFIX)
 
 
 def render(name):
-    return json.dumps({"host": PREFIX + name, "nickname": name, "projects": [{"paths": ["/workbench"]}]})
+    return json.dumps({"host": HOST_PREFIX + name, "nickname": name, "projects": [{"paths": [WORKDIR]}]})
 
 
 def line_indent(text, pos):
@@ -214,7 +289,7 @@ def edit_array(text, s, kstart, vstart, vend, want, eol):
     kept, removes = set(), []
     for idx, (a, b, val, ca) in enumerate(info):
         if ours(val):
-            n = val["host"][len(PREFIX):]
+            n = val["host"][len(HOST_PREFIX):]
             if n in want and n not in kept:
                 kept.add(n)
                 continue
@@ -261,21 +336,24 @@ def edit_array(text, s, kstart, vstart, vend, want, eol):
     return out, len(remaining) + len(adds)
 
 
-def plan(text, names, we_added_key=False):
+def our_hosts(cfg):
+    conns = cfg.get(KEY) if isinstance(cfg, dict) else None
+    return sorted(e["host"][len(HOST_PREFIX):] for e in conns if ours(e)) if isinstance(conns, list) else []
+
+
+def plan_settings(text, names, we_added_key=False):
     """(new text, key_added, key_removed) for exactly these names (ours).
 
-    The key is removed only when it ends up empty and we added it (a user's own
-    empty list stays)."""
-    if text.startswith("\ufeff"):  # a BOM stays, outside everything we parse
-        new, added, removed = plan(text[1:], names, we_added_key)
-        return "\ufeff" + new, added, removed
+    names None keeps our entries as they are (min ls failed: a partial list
+    must not prune). The key is removed only when it ends up empty and we
+    added it (a user's own empty list stays)."""
     eol = "\r\n" if "\r\n" in text else "\n"
     if not text.strip():
         text = "{" + eol + "}" + eol
     s = strip_jsonc(text)
     members, brace = top_members(s)
     found = [m for m in members if m[0] == KEY]
-    want = sorted(set(names))
+    want = sorted(set(our_hosts(json.loads(s)) if names is None else names))
     if not found:
         if not want:
             return text, False, False
@@ -285,7 +363,7 @@ def plan(text, names, we_added_key=False):
         return f"{text[:brace + 1]}{eol}{ind}\"{KEY}\": [{eol}{body}{eol}{ind}]{sep}{text[brace + 1:]}", True, False
     key, kstart, vstart, vend = found[-1]
     if s[vstart] != "[":
-        raise ValueError(f"{KEY} is not a list; fix it by hand")
+        raise ValueError(f"{KEY} is not a list")
     had_ours = any(ours(json.loads(s[a:b])) for a, b in elements(s, vstart, vend))
     new, left = edit_array(text, s, kstart, vstart, vend, want, eol)
     if left or not (had_ours and we_added_key):
@@ -310,140 +388,257 @@ def plan(text, names, we_added_key=False):
     return text[:a] + text[b:], False, True
 
 
-def our_hosts(cfg):
-    conns = cfg.get(KEY) if isinstance(cfg, dict) else None
-    return sorted(e["host"][len(PREFIX):] for e in conns if ours(e)) if isinstance(conns, list) else []
+# ---- tasks.json, keymap.json: a marked block in the top-level array ----
+
+def block_span(text):
+    """(line_start, line_end) of our marked block, or None."""
+    b = text.find(BEGIN)
+    e = text.find(END, b + 1) if b >= 0 else -1
+    if b < 0 or e < 0:
+        return None
+    line_start = text.rfind("\n", 0, b) + 1
+    line_end = text.find("\n", e)
+    line_end = len(text) if line_end < 0 else line_end + 1
+    if text[e + len(END) : line_end].strip().startswith(JOINED) and line_start > 0:
+        line_start -= 1
+        if line_start > 0 and text[line_start - 1] == "\r":
+            line_start -= 1
+    return line_start, line_end
 
 
-def backup(path, bdir):
+def block_lines(values, nl):
+    """Our block, every line ending in nl: the markers around the values, each
+    value followed by a comma (Zed takes a trailing one), so whatever comes
+    after the block needs no comma of ours."""
+    note = f"(managed by `{TOOL} config`; `{TOOL} config --remove` removes it; edits inside are replaced)"
+    lines = [f"  {BEGIN} {note}"]
+    lines += ["  " + json.dumps(v, indent=2, ensure_ascii=False).replace("\n", nl + "  ") + "," for v in values]
+    lines += [f"  {END}"]
+    return "".join(line + nl for line in lines)
+
+
+def plan_block(text, values, remove):
+    """The new text of a JSONC array file with our block holding `values`, or
+    with the block (and an array we added, while still empty) taken out."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    span = block_span(text)
+    out = text[: span[0]] + text[span[1]:] if span else text
+    s = strip_jsonc(out)
+    if s.strip() and s[ws(s, 0)] != "[":
+        raise ValueError("top level is not an array")
+    if remove:
+        m = out.find(ARRAY)
+        if m < 0:
+            return out
+        b = out.rfind("[", out.rfind("\n", 0, m) + 1, m)
+        if b < 0:
+            return out
+        le = out.find("\n", m)   # the end of the marked line, before its CR
+        le = len(out) if le < 0 else le - (out[le - 1] == "\r")
+        close = skip_value(s, b) - 1
+        if out[le:close].strip():
+            # the user put something in our array: it stays, without the mark
+            return out[: b + 1] + out[le:]
+        start, end = b, close + 1
+        if out.startswith(nl, end):
+            end += len(nl)
+        if JOINED in out[m:le] and out[:start].endswith(nl):
+            start -= len(nl)
+        return out[:start] + out[end:]
+    if not s.strip():
+        # no array: one of ours, after whatever comments are there
+        joined = bool(out) and not out.endswith("\n")
+        return f"{out}{nl if joined else ''}[ {ARRAY}{' ' + JOINED if joined else ''}{nl}{block_lines(values, nl)}]{nl}"
+    b = ws(s, 0)
+    le = out.find("\n", b)
+    if le >= 0 and not s[b + 1 : le].strip():
+        # the bracket ends its line (perhaps with a comment): the block follows it
+        return out[: le + 1] + block_lines(values, nl) + out[le + 1:]
+    ins = block_lines(values, nl)
+    return out[: b + 1] + nl + ins[: -len(nl)] + f" {JOINED}" + nl + out[b + 1:]
+
+
+# ---- files ----
+
+def read(path):
+    """(exists, text without its BOM, had a BOM)."""
+    if not os.path.exists(path):
+        return False, "", False
+    # newline="": CRLF files keep their line endings byte for byte
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    bom = text.startswith("﻿")
+    return True, text[1:] if bom else text, bom
+
+
+def backup(path, state):
+    """A dated copy of path under STATE/backups (beside it without a state dir)."""
+    real = os.path.realpath(path)
+    bdir = os.path.join(state, "backups") if state else (os.path.dirname(real) or ".")
     os.makedirs(bdir, mode=0o700, exist_ok=True)
-    base = os.path.join(bdir, "zed-settings.json." + time.strftime("%Y%m%dT%H%M%S"))
-    dst, i = base, 1
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    base = os.path.basename(path)
+    dst = os.path.join(bdir, f"{base}.{stamp}")
+    i = 1
     while os.path.exists(dst):
-        dst, i = f"{base}.{i}", i + 1
-    with open(path, "rb") as f, open(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as g:
-        g.write(f.read())
-    old = sorted(p for p in os.listdir(bdir) if p.startswith("zed-settings.json."))
-    for p in old[:-KEEP_BACKUPS]:
-        os.unlink(os.path.join(bdir, p))
+        dst = os.path.join(bdir, f"{base}.{stamp}.{i}")
+        i += 1
+    shutil.copy2(real, dst)
+    os.chmod(dst, 0o600)
     return dst
 
 
-def doctor(path, names):
-    def row(level, msg, fix=""):
-        print("\t".join([level, msg] + ([fix] if fix else [])))
-
-    if not os.path.exists(path):
-        return row("warn", f"{path} missing; no saved connections", "min-zed zed-config")
-    try:
-        with open(path, encoding="utf-8", newline="") as f:
-            cfg, _ = load_jsonc(f.read())
-    except ValueError as e:
-        return row("FAIL", f"{path} is not valid JSONC ({e})", "fix the syntax; Zed ignores a broken settings file")
-    have = our_hosts(cfg)
-    want = sorted(set(names))
-    if have == want:
-        row("ok", f"{len(have)} min-zed connection(s) in {path}")
-    else:
-        row("warn", f"{path} lists {', '.join(have) or 'none'}; live sessions: {', '.join(want) or 'none'}",
-            "min-zed zed-config")
-
-
-def load_record(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            r = json.load(f)
-        return r if isinstance(r, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def save_record(path, rec):
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".zed-config.", dir=os.path.dirname(path) or ".")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(rec, f)
-    os.replace(tmp, path)
-
-
-def write_atomic(path, text, exists):
-    """Replace the file Zed reads in one rename: a temp file beside the real
-    file (a dotfiles symlink stays a symlink to it), mode kept."""
+def write(path, state, text):
     real = os.path.realpath(path)
     d = os.path.dirname(real) or "."
+    saved = backup(path, state) if os.path.exists(real) else None
     os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".settings.json.", dir=d)
+    fd, tmp = tempfile.mkstemp(prefix=f".{os.path.basename(real)}.", dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.chmod(tmp, os.stat(real).st_mode & 0o7777 if exists else 0o644)
+        if os.path.exists(real):
+            shutil.copymode(real, tmp)
+        else:
+            os.chmod(tmp, 0o600)
         os.replace(tmp, real)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+    return saved
+
+
+def flag(state, name):
+    return os.path.join(state, name) if state else None
+
+
+def has(f):
+    return bool(f) and os.path.exists(f)
+
+
+def setflag(f, on):
+    if not f:
+        return
+    if on:
+        os.makedirs(os.path.dirname(f), exist_ok=True)
+        open(f, "w").close()
+    elif os.path.exists(f):
+        os.unlink(f)
+
+
+def doctor(a, hosts):
+    """CHECK<TAB>LEVEL<TAB>MESSAGE[<TAB>FIX] rows for `TOOL doctor`."""
+    def row(check, level, msg, fix=""):
+        print("\t".join([check, level, msg] + ([fix] if fix else [])))
+
+    if not has(flag(a.state, "settings-installed")):
+        return row("settings", "warn", f"not installed; no boxes in {EDITOR_NAME}'s Remote Projects, "
+                   "no Minimal tasks, no local-terminal key", f"{TOOL} config")
+    for check, path in (("settings", a.settings), ("tasks", a.tasks), ("keymap", a.keymap)):
+        try:
+            text = read(path)[1]
+            parsed = load_jsonc(text)
+            if check == "settings":
+                have = our_hosts(parsed)
+                missing = sorted(set(hosts) - set(have))
+                stale = sorted(set(have) - set(hosts))
+                if missing or stale:
+                    row(check, "warn", f"{KEY} out of date (missing: {' '.join(missing) or '-'}; "
+                        f"stale: {' '.join(stale) or '-'})", f"{TOOL} config")
+                else:
+                    row(check, "ok", f"{KEY}: {len(have)} {HOST_PREFIX}* host(s) in {path}")
+            elif not block_span(text):
+                row(check, "warn", f"no {TOOL} block in {path}", f"{TOOL} config")
+            elif plan_block(text, TASKS if check == "tasks" else KEYMAP, False) != text:
+                row(check, "warn", f"the {TOOL} block in {path} is out of date", f"{TOOL} config")
+            elif check == "tasks":
+                row(check, "ok", f"{len(TASKS)} Minimal tasks in {path}")
+            else:
+                row(check, "ok", f"{LOCAL_TERMINAL_KEY} opens a Mac terminal ({path})")
+        except (ValueError, IndexError) as e:
+            row(check, "FAIL", f"{path} is not valid JSONC ({e})", f"fix it by hand; {EDITOR_NAME} ignores a broken file")
 
 
 def main():
+    global HOST_PREFIX
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("names", nargs="*", help="live session names")
-    ap.add_argument("--settings", default=os.environ.get("MIN_ZED_SETTINGS") or os.path.expanduser("~/.config/zed/settings.json"))
-    ap.add_argument("--backup-dir", default=None, help="where dated backups go (default: next to the settings)")
-    ap.add_argument("--record", default=None, help="JSON file remembering what we created (the file, the key)")
-    ap.add_argument("--remove", action="store_true", help="drop every min-zed.* entry")
-    ap.add_argument("--dry-run", action="store_true", help="print the resulting file; write nothing")
-    ap.add_argument("--doctor", action="store_true", help="report for `min-zed doctor`; write nothing")
-    ap.add_argument("--quiet", action="store_true", help="say nothing when nothing changes")
+    ap.add_argument("--settings", default=os.environ.get(ENV_SETTINGS) or SETTINGS_DEFAULT)
+    ap.add_argument("--tasks", default=os.environ.get(ENV_TASKS) or TASKS_DEFAULT)
+    ap.add_argument("--keymap", default=os.environ.get(ENV_KEYMAP) or KEYMAP_DEFAULT)
+    ap.add_argument("--state", default=os.environ.get(ENV_STATE, ""))
+    ap.add_argument("--prefix", default=HOST_PREFIX)
+    ap.add_argument("--install", action="store_true", help="opt in, write the tasks and keymap blocks, then sync")
+    ap.add_argument("--remove", action="store_true", help="take everything of ours out; opt out")
+    ap.add_argument("--sync", nargs="*", metavar="NAME", help="the live session names")
+    ap.add_argument("--doctor", nargs="*", metavar="NAME", help="report on the three files; write nothing")
+    ap.add_argument("--dry-run", action="store_true", help="print the resulting files; write nothing")
     a = ap.parse_args()
-    bad = [n for n in a.names if not NAME_RE.match(n)]
-    if bad:
-        sys.exit(f"min-zed-config: not a session name: {bad[0]!r}")
-    if a.doctor:
-        return doctor(a.settings, a.names)
+    HOST_PREFIX = a.prefix
 
-    path = a.settings
-    exists = os.path.exists(path)
-    rec = load_record(a.record) if a.record else {}
-    text = ""
-    if exists:
-        with open(path, encoding="utf-8", newline="") as f:
-            text = f.read()
-    try:
-        current, _ = load_jsonc(text)
-        target, added, removed = plan(text, [] if a.remove else a.names, bool(rec.get("added_key")))
-        result, _ = load_jsonc(target)
-    except (ValueError, IndexError) as e:
-        sys.exit(f"min-zed-config: {path}: cannot edit ({e}); edit ssh_connections by hand")
+    if a.doctor is not None:
+        return doctor(a, [h for h in a.doctor if NAME_RE.match(h)])
+    # no --sync: the live list is unknown (min ls failed); keep our entries
+    hosts = None if a.sync is None else [h for h in a.sync if NAME_RE.match(h)]
+    marker = flag(a.state, "settings-installed")
+    key_added = flag(a.state, "settings-key-added")
+    if not (a.install or a.remove or a.dry_run) and not has(marker):
+        return  # --sync before the opt-in: touch nothing
+    files = [("settings", a.settings)]
+    if a.install or a.remove:
+        files += [("tasks", a.tasks), ("keymap", a.keymap)]
 
-    # We made the file and it is back to nothing of anyone's: remove it.
-    delete = a.remove and exists and rec.get("created_file") and result == {}
+    # Every file is planned before any is written: one that does not parse stops all.
+    plans = []
+    for what, path in files:
+        exists, text, bom = read(path)
+        try:
+            current = load_jsonc(text)
+            if what == "settings":
+                if current is not None and not isinstance(current, dict):
+                    raise ValueError("top level is not an object")
+                target, added, removed = plan_settings(text, [] if a.remove else hosts, has(key_added))
+                result = load_jsonc(target)
+                same, empty = result == (current or {}), result in (None, {})
+            else:
+                if current is not None and not isinstance(current, list):
+                    raise ValueError("top level is not an array")
+                target = plan_block(text, TASKS if what == "tasks" else KEYMAP, a.remove)
+                load_jsonc(target)
+                added = removed = False
+                same, empty = target == text, not target.strip()
+        except (ValueError, IndexError) as e:
+            sys.exit(f"{TOOL}-config: {path}: cannot parse or edit as JSONC ({e}); fix it by hand")
+        plans.append((what, path, exists, bom, target, added, removed, same, empty))
+
     if a.dry_run:
-        sys.stdout.write("" if delete else target)
+        for what, path, exists, bom, target, *_ in plans:
+            sys.stdout.write(f"// {path}\n{target}" + ("" if target.endswith("\n") else "\n"))
         return
-    if result == current and not delete:
-        if not a.quiet:
-            print(f"{path}: min-zed connections already up to date")
-        return
-
-    bdir = a.backup_dir or os.path.dirname(path) or "."
-    saved = backup(path, bdir) if exists else None
-    if delete:
-        os.unlink(path)
-        rec = {}
-    else:
-        write_atomic(path, target, exists)
-        if not exists:
-            rec["created_file"] = True
-        if added:
-            rec["added_key"] = True
-        if removed:
-            rec["added_key"] = False
-    if a.record:
-        save_record(a.record, rec)
-    what = "removed (min-zed created it)" if delete else f"min-zed connections now {', '.join(our_hosts(result)) or 'none'}"
-    print(f"min-zed-config: {path}: {what}" + (f" (previous version: {saved})" if saved else ""), file=sys.stderr)
+    if a.install:
+        setflag(marker, True)
+    for what, path, exists, bom, target, added, removed, same, empty in plans:
+        created = flag(a.state, f"{what}-created")
+        if a.remove and exists and empty and has(created) and not os.path.islink(path):
+            # we made the file and nothing of anyone's is left in it
+            backup(path, a.state)
+            os.unlink(path)
+            print(f"removed {path}, which {TOOL} created and is empty again")
+        elif same or (not exists and a.remove):
+            print(f"{path}: already {'clean' if a.remove else 'up to date'}; nothing to do")
+        else:
+            saved = write(path, a.state, ("﻿" if bom else "") + target)
+            if a.install and not exists:
+                setflag(created, True)  # so --remove may delete the file again
+            verb = f"removed {TOOL} entries from" if a.remove else "updated"
+            print(f"{verb} {path}" + (f" (previous version: {saved})" if saved else ""))
+        if added or removed:
+            setflag(key_added, added)
+        if a.remove:
+            setflag(created, False)
+    if a.remove:
+        setflag(marker, False)
+        setflag(key_added, False)
 
 
 if __name__ == "__main__":

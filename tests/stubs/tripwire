@@ -1,6 +1,6 @@
 #!/bin/sh
-# Tripwire on the test PATH for programs min-cmux must never reach in a test
-# (open, osascript, editors, a bare herdr): the call is logged and fails, and
+# Tripwire on the test PATH for programs min-zed must never reach in a test
+# (open, osascript, editors): the call is logged and fails, and
 # the runner fails the case, instead of the real program running.
 echo "tripwire $(basename "$0") $*" >> "$STUB_LOG"
 echo "$(basename "$0") $*" >> "${TRIPWIRE_LOG:-/dev/null}"

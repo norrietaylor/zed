@@ -1,4 +1,2 @@
-/.state/
-*.log
 __pycache__/
 .claude/

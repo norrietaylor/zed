@@ -1,73 +1,56 @@
 # min-zed: Minimal sessions as Zed remote projects. Every recipe runs on the HOST.
 # `just --list` for the menu.
 
-config := env_var_or_default("XDG_CONFIG_HOME", env_var("HOME") + "/.config") + "/minimal"
 
 _default:
     @just --list
 
-# shellcheck, py_compile, the test suite (kernel hash pin included).
+# shellcheck, py_compile, and the test suite (normal and long host prefix).
 check:
     #!/bin/sh
     set -eu
     shellcheck -s sh bin/min-zed tests/run.sh tests/stubs/*
     python3 -m py_compile bin/min-zed-config
-    rm -rf bin/__pycache__
     sh tests/run.sh
+    LONG_PREFIX=1 sh tests/run.sh
 
-# Link min-zed into ~/.local/bin, install the `zed` loadout, write the ssh stanzas, opt in to Zed settings sync.
-install: && loadout ssh-config zed-config
-    mkdir -p "$HOME/.local/bin"
-    ln -sfn "$PWD/bin/min-zed" "$HOME/.local/bin/min-zed"
-    @echo "linked $HOME/.local/bin/min-zed -> $PWD/bin/min-zed"
+# Link min-zed into ~/.local/bin, install the `zed` loadout and Minimal's skills, write the ssh stanzas, wire Zed (ssh_connections, tasks, key).
+install:
+    "$PWD/bin/min-zed" setup
 
-# Link loadouts/zed.toml into the Minimal config as loadout `zed` (config.toml is left alone).
-loadout:
+# Minimal's skills for the agents (Zed's, Claude), vendored from gominimal/minimal-skills (MIT) at a pinned commit
+# (version 0.7.0): the host ones in skills/ (setup installs them into ~/.agents/skills and ~/.claude/skills on the Mac),
+# minimal-sandbox in loadouts/zed/skills/ (the loadout copies it into every box).
+skills_commit := "0f4c117103df13c4ab8f3f3948827b4b4f63ee56"
+skills_sha256 := "5061e6b7b86a24d0c8971df23974d1982a92c285995147e5b32af2e880a0dc24"
+
+# Re-fetch the vendored skills (after changing skills_commit and skills_sha256).
+skills:
     #!/bin/sh
     set -eu
-    loadouts="{{ config }}/loadouts"
-    mkdir -p "$loadouts"
-    l="$loadouts/zed.toml"
-    if [ -e "$l" ] || [ -L "$l" ]; then
-        if [ "$(readlink "$l" 2>/dev/null)" != "$PWD/loadouts/zed.toml" ]; then
-            echo "$l exists and is not this repo's; move it aside, then run just loadout again" >&2
-            exit 1
-        fi
-    fi
-    ln -sfn "$PWD/loadouts/zed.toml" "$l"
-    echo "installed loadout 'zed' -> $l (min-zed activates with --loadout zed)"
+    t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+    curl -fsSL "https://codeload.github.com/gominimal/minimal-skills/tar.gz/{{ skills_commit }}" -o "$t/a.tgz"
+    got=$(shasum -a 256 "$t/a.tgz" 2>/dev/null || sha256sum "$t/a.tgz"); got=${got%% *}
+    [ "$got" = "{{ skills_sha256 }}" ] || { echo "sha256 mismatch: $got" >&2; exit 1; }
+    tar -xzf "$t/a.tgz" -C "$t" --strip-components 1
+    rm -rf skills loadouts/zed/skills
+    mkdir -p skills loadouts/zed/skills
+    for d in "$t"/skills/*/; do
+        d=${d%/}; n=$(basename "$d")   # no trailing slash: BSD cp would copy the contents only
+        if [ "$n" = minimal-sandbox ]; then cp -R "$d" loadouts/zed/skills/; else cp -R "$d" skills/; fi
+    done
+    cp "$t/LICENSE" skills/LICENSE
+    cp "$t/LICENSE" loadouts/zed/skills/LICENSE
+    echo "skills at {{ skills_commit }}: $(ls skills | grep -v LICENSE | tr '\n' ' ')+ minimal-sandbox (box)"
 
 # Write Host min-zed.NAME stanzas to ~/.ssh/min-zed.conf and Include them from the top of ~/.ssh/config.
 ssh-config:
-    "$HOME/.local/bin/min-zed" ssh-config
+    "$PWD/bin/min-zed" ssh-config
 
-# Keep Zed's ssh_connections (min-zed.* entries only) in step with live sessions.
+# Opt in to the Zed wiring: ssh_connections per session in settings.json, the Minimal tasks in tasks.json, the local-terminal key in keymap.json.
 zed-config:
-    "$HOME/.local/bin/min-zed" zed-config
+    "$PWD/bin/min-zed" config
 
-# Undo `install`: drop the ssh Include and Zed entries, stop the watch, unlink only what points here.
+# Undo `install`, touching only what is ours: Zed entries and blocks, ssh Include, skill copies, loadout link and copy, CLI link.
 uninstall:
-    #!/bin/sh
-    set -eu
-    b="$HOME/.local/bin/min-zed"
-    if [ -x "$b" ]; then
-        "$b" ssh-config --remove || true
-        "$b" zed-config --remove || true
-        "$b" watch --stop || true
-    fi
-    for l in "{{ config }}/loadouts/zed.toml" "$b"; do
-        if [ -L "$l" ]; then
-            case "$(readlink "$l")" in
-                "$PWD"/*) rm -f "$l"; echo "removed $l" ;;
-                *) echo "$l does not point into this repo; leaving it" ;;
-            esac
-        fi
-    done
-    echo "left ${XDG_STATE_HOME:-$HOME/.local/state}/min-zed in place: it holds the keys of live sessions"
-
-# Re-pin tests/kernel.sha to the kernel block in bin/min-zed (after copying it from the cmux repo).
-kernel-sha:
-    #!/bin/sh
-    set -eu
-    sh tests/kernel-sha.sh bin/min-zed > tests/kernel.sha
-    echo "tests/kernel.sha: $(cat tests/kernel.sha)"
+    "$PWD/bin/min-zed" setup --remove

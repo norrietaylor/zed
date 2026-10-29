@@ -1,45 +1,49 @@
-description = "sshd for Zed remote projects (min-zed), plus Claude Code state for min-zed watch"
+description = "sshd for Zed remote projects (min-zed)"
 
-# Layer this onto a Minimal session that min-zed opens in Zed as
-# `zed ssh://min-zed.NAME/workbench`. Zed reaches the box with stock ssh whose
+# min-zed activates sessions with `--loadout zed` (never through
+# default_loadouts) and reaches them as `ssh min-zed.NAME`: stock ssh whose
 # ProxyCommand runs an OpenSSH sshd *inside* the box through
-# `min session exec`, so this loadout brings openssh and prepares the pieces of
-# that sshd that are better done once at activation than on every connect.
-# min-zed activates every session with `--loadout zed` (which makes min skip
-# default_loadouts), so nothing here depends on the user's defaults.
-#
-# Claude Code state: the hook registered below records one line,
-# "state epoch message", in /home/.min-zed/agent-state. The host's
-# `min-zed watch` reads that file through `min session exec` while Zed (or any
-# ssh client) is connected, and posts a macOS notification when Claude needs
-# input or has finished. There is no relay and no port: Zed has no
-# notification channel a box can reach.
+# `min session exec`. Zed (`zed ssh://min-zed.NAME/workbench`) then
+# downloads its remote server into /home/.zed_server
+# (zed-remote-server-stable-<version>+stable.<build>.<sha>), which persists
+# with the session, and runs Claude Agent there with the Node it downloads
+# itself (~/.local/share/zed/node): no node here.
 #
 # The box user is uid 1000 with $HOME=/home; every path below hangs off it.
 
-# openssh supplies sshd and ssh-keygen. curl downloads Zed's remote server
-# (Zed does that itself over ssh; min-zed's optional pre-fetch does it too).
-# jq builds the hook's state line and merges Claude Code's settings. rsync is
-# here so `rsync -e ssh` works against min-zed.NAME; xxhash is its missing
-# runtime library (Minimal's rsync does not pull it in).
-packages = ["openssh", "curl", "jq", "rsync", "xxhash"]
+# openssh supplies sshd and ssh-keygen.
+# The box already has bash, tar, curl, python3 and zsh; curl is listed so
+# Zed's server download never depends on the base image. rsync works over
+# `min-zed.NAME` with xxhash, its missing runtime library. git: Zed's git
+# panel runs it in the box, and work leaves a box by push.
+packages = ["openssh", "curl", "rsync", "xxhash", "git"]
 
-# Prepare the in-box sshd that min-zed's ProxyCommand runs. min-zed does the
-# same on every connect (its PREP script, which also writes the authorized key
-# and makes the host key, under a lock, before sshd starts); doing it here too
-# means the environment file reflects the activation. No host key here: a
-# second, unlocked ssh-keygen would race PREP's.
+# Minimal's in-box skill for Claude Code (and Zed's Claude Agent) in the box,
+# which reads ~/.claude/skills. Zed's own agent runs on the Mac, where
+# `min-zed setup` puts the host skills. Vendored from
+# gominimal/minimal-skills (`just skills`); `min-zed setup` copies this
+# loadout's zed/ directory ($LOADOUT_ROOT).
+patches = [
+  { description = "minimal-sandbox skill for Claude Code", dest = ".claude/skills/minimal-sandbox/", source = "$LOADOUT_ROOT/skills/minimal-sandbox" },
+]
+
+# Prepare the in-box sshd environment. min-zed repeats this on every
+# connect (its PREP script, which also writes the authorized key and makes the
+# host key under a lock); doing it here too means the environment file
+# reflects the activation. No host key here: an unlocked ssh-keygen would race
+# PREP's.
 #
-# sshd scrubs the environment of the sessions it starts, so Zed's terminals
-# would lose MINIMAL_SESSION_NAME and every loadout var. min-zed runs sshd with
-# PermitUserEnvironment=yes, which restores them from ~/.ssh/environment —
-# written here from `env`, filtered exactly as PREP filters it (sshd sets TERM,
-# HOME, PATH, SSH_* itself; PROMPT_COMMAND/MINIMAL_MOTD are minimald's
-# attach-shell banner and break an ssh-started bash).
+# sshd scrubs the environment, so the sshd min-zed runs has
+# PermitUserEnvironment=yes and reads ~/.ssh/environment, written here from
+# `env` and filtered exactly as PREP filters it (PROMPT_COMMAND/MINIMAL_MOTD are
+# minimald's attach banner and break an ssh-started bash).
 #
-# Guarded: a failure here must not abort the activation (a failing
-# on_activate would). Commands that don't need stdin get </dev/null — the
-# script itself arrives on the shell's stdin.
+# The rc line moves an interactive shell that starts in $HOME (/home, where
+# sshd and Zed's terminals start) to /workbench, once (the
+# `min:workbench` marker; PREP adds the same line on connect).
+#
+# Guarded: a failure here must not abort the activation. Commands that do not
+# need stdin get </dev/null: the script itself arrives on the shell's stdin.
 [[lifecycle_hooks]]
 description = "prepare the in-box sshd environment for min-zed"
 on_activate.type = "inline"
@@ -47,92 +51,13 @@ on_activate.value = '''
 umask 077
 mkdir -p "$HOME/.ssh" </dev/null || true
 env </dev/null | grep -E "^[A-Za-z_][A-Za-z0-9_]*=" | grep -Ev "^(TERM|PWD|OLDPWD|SHLVL|_|HOME|USER|LOGNAME|PATH|SSH_[A-Z_]*|PROMPT_COMMAND|MINIMAL_MOTD)=" > "$HOME/.ssh/environment" || true
-# Shells that sshd starts begin in $HOME (/home); `min session attach` starts
-# in /workbench. Make interactive shells that land in $HOME move to the
-# project, and only then. One line per rc file, shared by every min-<client>
-# loadout: a line from minx (`minx:workbench`) or another min-<client> tool
-# (`min:workbench`) counts, so no box gets two.
 for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
-  if ! grep -Eqs "(minx|min):workbench" "$rc" </dev/null; then
-    printf '%s\n' '# min:workbench (managed by the min-zed loadout)' \
+  if ! grep -qs "min:workbench" "$rc" </dev/null; then
+    printf '%s\n' '# min:workbench (managed by min-zed)' \
       'case $- in *i*) if [ "$PWD" = "$HOME" ] && [ -d /workbench ]; then cd /workbench; fi ;; esac' >> "$rc" </dev/null || true
   fi
 done
 # bash login shells (what sshd starts) read ~/.bash_profile, not ~/.bashrc.
 [ -e "$HOME/.bash_profile" ] || printf '%s\n' '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"' > "$HOME/.bash_profile" </dev/null || true
-true
-'''
-
-# Register the state hook with Claude Code (user settings, so it fires in
-# every project in the box). Writes ~/.claude/min-zed-hook.sh, then merges one
-# entry per event into ~/.claude/settings.json with jq: existing settings and
-# every other hook are kept (other min-<client> tools' and minx's included),
-# and a previous copy of ours (any command naming min-zed-hook) is replaced
-# rather than duplicated, so re-activation is idempotent.
-#
-# The hook never gets in Claude's way: it prints nothing (stdout from a
-# SessionStart or UserPromptSubmit hook becomes Claude's context), touches
-# only its own file (temp + rename, so the host never reads half a line), and
-# exits 0 whatever happens.
-#
-# Guarded: a failure here must not abort the activation, so an unreadable
-# settings file is reported on stderr and left alone.
-[[lifecycle_hooks]]
-description = "register a Claude Code hook that records agent state for min-zed watch"
-on_activate.type = "inline"
-on_activate.value = '''
-D="$HOME/.claude"
-H="$D/min-zed-hook.sh"
-S="$D/settings.json"
-mkdir -p "$D" </dev/null
-cat > "$H" <<'EOF'
-#!/bin/sh
-# Written by the Minimal `zed` loadout (min-zed); re-written on every activation.
-# Records one Claude Code hook event (JSON on stdin) as the line
-# "state epoch message" in ~/.min-zed/agent-state, which the host's
-# `min-zed watch` reads. Prints nothing and always exits 0.
-command -v jq >/dev/null 2>&1 || exit 0
-in=$(cat) || exit 0
-field() { printf '%s' "$in" | jq -r "$1" 2>/dev/null; }
-# One-line message text: whitespace runs flattened, cut at 200 characters.
-text() { field "($1 // \"\") | tostring | gsub(\"[\\r\\n\\t]+\"; \" \") | .[0:200]"; }
-record() {
-  d="$HOME/.min-zed"
-  mkdir -p "$d" 2>/dev/null || return 0
-  t="$d/.agent-state.$$"
-  if printf '%s %s %s\n' "$1" "$(date +%s)" "${2:-}" > "$t" 2>/dev/null; then
-    mv -f "$t" "$d/agent-state" 2>/dev/null || rm -f "$t"
-  fi
-}
-case $(field '.hook_event_name // ""') in
-  SessionStart) record started ;;
-  UserPromptSubmit|PreToolUse|PostToolUse) record working ;;
-  PermissionRequest) record needs-input "Permission: $(text .tool_name)" ;;
-  Notification)
-    case $(field '.notification_type // ""') in
-      permission_prompt|elicitation_dialog) record needs-input "$(text .message)" ;;
-      idle_prompt) record idle ;;
-    esac ;;
-  Stop) record finished "$(text .last_assistant_message)" ;;
-  SessionEnd) record clear ;;
-esac
-exit 0
-EOF
-[ -s "$S" ] || printf '{}\n' > "$S"
-T=$(mktemp </dev/null)
-if jq --arg cmd "sh $H" '
-  .hooks = (.hooks // {})
-  | reduce ("SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest",
-            "Notification", "Stop", "SessionEnd") as $e (.;
-      .hooks[$e] = [(.hooks[$e] // [])[]
-                    | select(any(.hooks[]?; (.command? // "" | tostring) | test("min-zed-hook")) | not)]
-        + [{hooks: [{type: "command", command: $cmd, timeout: 5}]}
-           + (if $e == "PreToolUse" or $e == "PostToolUse" then {matcher: "*"} else {} end)])
-' "$S" > "$T" </dev/null; then
-  cat "$T" > "$S" </dev/null || echo "min-zed loadout: could not write $S; Claude Code hook not registered" >&2
-else
-  echo "min-zed loadout: $S is not a JSON object; Claude Code hook not registered" >&2
-fi
-rm -f "$T" </dev/null
 true
 '''
