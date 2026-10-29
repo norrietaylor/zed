@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stub for the Zed CLI: logs argv; `--version` answers like Zed 1.26.2
+# ("Zed 1.26.2 – /Applications/Zed.app"), or $STUB_ZED_VERSION_LINE.
+echo "zed $*" >> "$STUB_LOG"
+if [ "${1:-}" = --version ]; then
+    printf '%s\n' "${STUB_ZED_VERSION_LINE:-Zed 1.26.2 – /Applications/Zed.app}"
+fi
+exit 0

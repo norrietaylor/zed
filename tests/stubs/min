@@ -1,0 +1,42 @@
+#!/bin/sh
+# Stub for min: logs argv (multi-line args collapsed to <script>), serves fixtures.
+line="min"
+for a in "$@"; do
+    case $a in
+        *'
+'*) a='<script>' ;;
+    esac
+    line="$line $a"
+done
+echo "$line" >> "$STUB_LOG"
+case "${1:-} ${2:-}" in
+    "version "*) printf 'Client: minimal %s\nServer: minimald 0.7.0\n' "${STUB_MIN_VERSION:-0.7.0}" ;;
+    "loadout list") cat "$FIXTURES/loadouts.txt" 2>/dev/null ;;
+    "ls --json") cat "$FIXTURES/sessions.json" ;;
+    "session activate")
+        [ -f "$FIXTURES/sessions.after.json" ] && cp "$FIXTURES/sessions.after.json" "$FIXTURES/sessions.json"
+        exit 0 ;;
+    "session exec")
+        # prepare: min session exec NAME sh -c PREP TOOL PUBKEY
+        # anything else (the _proxy sshd argv): echo it, as the ssh byte stream
+        if [ "${4:-}" = sh ]; then
+            printf '%s' "$8" > "$STUB_LOG.pubkey"
+            [ ! -f "$FIXTURES/exec.hook" ] || sh "$FIXTURES/exec.hook"   # e.g. a session appears meanwhile
+            cat "$FIXTURES/facts.txt"
+        else
+            printf 'sshd-stub'; printf ' [%s]' "$@"; echo
+        fi ;;
+    "session destroy")
+        rc=0
+        [ -f "$FIXTURES/destroy.rc" ] && rc=$(cat "$FIXTURES/destroy.rc")
+        # destroy.needs-force: unsaved changes and no terminal, as min says it
+        if [ -f "$FIXTURES/destroy.needs-force" ] && [ "${4:-}" != --force ]; then
+            echo "error: refusing to destroy the session without confirmation; pass --force" >&2; exit 1
+        fi
+        if [ "$rc" = 0 ]; then
+            jq --arg n "$3" '.sessions |= map(select(.name != $n))' "$FIXTURES/sessions.json" > "$FIXTURES/sessions.tmp" \
+                && mv "$FIXTURES/sessions.tmp" "$FIXTURES/sessions.json"
+        fi
+        exit "$rc" ;;
+esac
+exit 0

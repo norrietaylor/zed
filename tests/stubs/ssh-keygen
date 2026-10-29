@@ -1,0 +1,29 @@
+#!/bin/sh
+# Stub for ssh-keygen: logs argv, writes fake private/public key at -f PATH.
+# STUB_KEYGEN_DELAY=N: tag both keys with the pid so a mismatched pair is
+# visible, and sleep N seconds after the private key and again halfway
+# through the public key, so a reader of a file in progress sees it torn.
+# STUB_KEYGEN_DELAY=jitter: the same with 10-90ms, varying by pid.
+# STUB_KEYGEN_FAIL=1: write a partial private key, then fail.
+echo "ssh-keygen $*" >> "$STUB_LOG"
+while [ $# -gt 0 ]; do
+    if [ "$1" = -f ]; then
+        if [ -n "${STUB_KEYGEN_FAIL:-}" ]; then
+            printf 'PRIV' > "$2"
+            exit 1
+        elif [ -n "${STUB_KEYGEN_DELAY:-}" ]; then
+            s=$STUB_KEYGEN_DELAY
+            [ "$s" != jitter ] || s=0.0$(($$ % 9 + 1))
+            printf 'PRIVATE %s\n' "$$" > "$2"
+            sleep "$s"
+            printf 'ssh-ed25519 ' > "$2.pub"
+            sleep "$s"
+            printf 'AAAAPUB%s min-zed:test\n' "$$" >> "$2.pub"
+        else
+            printf 'PRIVATE\n' > "$2"
+            printf 'ssh-ed25519 AAAAPUB min-zed:test\n' > "$2.pub"
+        fi
+    fi
+    shift
+done
+exit 0

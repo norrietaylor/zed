@@ -1,0 +1,66 @@
+description = "sshd for Zed remote projects (min-zed)"
+
+# min-zed activates sessions with `--loadout zed` (never through
+# default_loadouts) and reaches them as `ssh min-zed.NAME`: stock ssh whose
+# ProxyCommand runs an OpenSSH sshd *inside* the box through
+# `min session exec`. Zed (`zed ssh://min-zed.NAME/workbench`) then
+# downloads its remote server into /home/.zed_server
+# (zed-remote-server-stable-<version>+stable.<build>.<sha>), which persists
+# with the session, and runs Claude Agent there with the Node it downloads
+# itself (~/.local/share/zed/node): no node here.
+#
+# The box user is uid 1000 with $HOME=/home; every path below hangs off it.
+
+# openssh supplies sshd and ssh-keygen.
+# The box already has bash, tar, curl, python3 and zsh; curl is listed so
+# Zed's server download never depends on the base image. rsync works over
+# `min-zed.NAME` with xxhash, its missing runtime library. git: Zed's git
+# panel runs it in the box, and work leaves a box by push.
+packages = ["openssh", "curl", "rsync", "xxhash", "git"]
+
+# Minimal's in-box skill for Claude Code (and Zed's Claude Agent) in the box,
+# which reads ~/.claude/skills. Zed's own agent runs on the Mac, where
+# `min-zed setup` puts the host skills. Vendored from
+# gominimal/minimal-skills (`just skills`); `min-zed setup` copies this
+# loadout's zed/ directory ($LOADOUT_ROOT).
+patches = [
+  { description = "minimal-sandbox skill for Claude Code", dest = ".claude/skills/minimal-sandbox/", source = "$LOADOUT_ROOT/skills/minimal-sandbox" },
+]
+
+# Prepare the in-box sshd environment. min-zed repeats this on every
+# connect (its PREP script, which also writes the authorized key and makes the
+# host key under a lock); doing it here too means the environment file
+# reflects the activation. No host key here: an unlocked ssh-keygen would race
+# PREP's.
+#
+# sshd scrubs the environment, so the sshd min-zed runs has
+# PermitUserEnvironment=yes and reads ~/.ssh/environment, written here from
+# `env` and filtered exactly as PREP filters it (PROMPT_COMMAND/MINIMAL_MOTD are
+# minimald's attach banner and break an ssh-started bash), plus, as PREP does,
+# CLAUDE_CODE_EXECUTABLE=/usr/bin/claude when the box has Minimal's claude
+# package, so Zed's Claude Agent runs it with Minimal's plugin.
+#
+# The rc line moves an interactive shell that starts in $HOME (/home, where
+# sshd and Zed's terminals start) to /workbench, once (the
+# `min:workbench` marker; PREP adds the same line on connect).
+#
+# Guarded: a failure here must not abort the activation. Commands that do not
+# need stdin get </dev/null: the script itself arrives on the shell's stdin.
+[[lifecycle_hooks]]
+description = "prepare the in-box sshd environment for min-zed"
+on_activate.type = "inline"
+on_activate.value = '''
+umask 077
+mkdir -p "$HOME/.ssh" </dev/null || true
+env </dev/null | grep -E "^[A-Za-z_][A-Za-z0-9_]*=" | grep -Ev "^(TERM|PWD|OLDPWD|SHLVL|_|HOME|USER|LOGNAME|PATH|SSH_[A-Z_]*|PROMPT_COMMAND|MINIMAL_MOTD)=" > "$HOME/.ssh/environment" || true
+if [ -x /usr/bin/claude ] && [ -z "${CLAUDE_CODE_EXECUTABLE:-}" ]; then echo "CLAUDE_CODE_EXECUTABLE=/usr/bin/claude" >> "$HOME/.ssh/environment" || true; fi
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  if ! grep -qs "min:workbench" "$rc" </dev/null; then
+    printf '%s\n' '# min:workbench (managed by min-zed)' \
+      'case $- in *i*) if [ "$PWD" = "$HOME" ] && [ -d /workbench ]; then cd /workbench; fi ;; esac' >> "$rc" </dev/null || true
+  fi
+done
+# bash login shells (what sshd starts) read ~/.bash_profile, not ~/.bashrc.
+[ -e "$HOME/.bash_profile" ] || printf '%s\n' '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"' > "$HOME/.bash_profile" </dev/null || true
+true
+'''

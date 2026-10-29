@@ -1,0 +1,6 @@
+#!/bin/sh
+# Stub for ssh: logs argv and succeeds. `-G` (config dump, no connection)
+# goes to the real ssh so doctor and the tests can parse ~/.ssh/config.
+case ${1:-} in -G) exec /usr/bin/ssh "$@" ;; esac
+echo "ssh $*" >> "$STUB_LOG"
+exit 0

@@ -1,0 +1,7 @@
+#!/bin/sh
+# Stub for mv, linked only by the PREP cases: the real mv, then with
+# STUB_MV_DELAY a sleep after moving a key out of its temp name (.new.*), so
+# waiters get to look between the two renames.
+/bin/mv "$@" || exit
+case "$*" in *"/.new."*) [ -z "${STUB_MV_DELAY:-}" ] || sleep "$STUB_MV_DELAY" ;; esac
+exit 0

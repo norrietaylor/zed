@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stub for ps: the process list (PID PPID ARGS lines) in_use_names scans for
+# boxes in use is $FIXTURES/ps.txt; any other query goes to the real ps.
+# With $FIXTURES/ps.later.txt, every scan after the first serves that instead.
+if [ "$*" = "-xo pid=,ppid=,args=" ]; then
+    n=$(($(cat "$FIXTURES/ps.calls" 2>/dev/null || echo 0) + 1)); echo "$n" > "$FIXTURES/ps.calls"
+    if [ "$n" -gt 1 ] && [ -f "$FIXTURES/ps.later.txt" ]; then cat "$FIXTURES/ps.later.txt"; else cat "$FIXTURES/ps.txt" 2>/dev/null; fi
+    exit 0
+fi
+exec /bin/ps "$@"
