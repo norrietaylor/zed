@@ -167,6 +167,14 @@ own surfaces, which `setup` wires: the Remote Projects list
   the task variables are exported too. `ZED_WORKTREE_ROOT` is set without a
   directory check: in a single-file window it is the file. Tasks run in an interactive terminal (`sh -i -c`), so `[ -t 0 ]`
   holds.
+- Restricted Mode (Zed source, v1.26.2): trust is stored per (ssh user,
+  host, path) in Zed's SQLite db, read at startup and rewritten from memory,
+  so each new box asks once. The Mac decides itself
+  (`worktree_store.rs` calls `can_trust` with the Mac's settings), so a
+  `"linux"` settings override that reaches the box server does not stop the
+  dialog. The only switch, `session.trust_all_worktrees`, also trusts every
+  local folder: `config` never writes it. Per-host trust asked upstream:
+  zed-industries/zed#66313.
 - Zed downloads its remote server into the box itself:
   `~/.zed_server/zed-remote-server-stable-<ver>+stable.<build>.<sha>`.
   Claude Agent (ACP) runs in the box with the Node Zed downloads
