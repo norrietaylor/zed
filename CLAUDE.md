@@ -104,6 +104,11 @@ own surfaces, which `setup` wires: the Remote Projects list
   ProxyCommand `ssh` builds.
 - `gc` and `destroy` never destroy without an explicit y; `-y` is the only
   way past `destroy`'s question.
+- A box is gone (keys, records and stanza dropped, `client_on_destroy` run
+  by `destroy_one`) only when a successful `min ls` no longer lists it; a
+  failed `min ls` keeps everything (ssh-config not rewritten), warns, and
+  after a y exits non-zero; `destroy NAME` drops what was kept once a
+  successful `min ls` no longer lists NAME.
 - `gc` offers only own sessions (`own_ls`: a key dir `STATE/sessions/NAME`),
   and `gc`/`status` date only those in `orphan/` (`track_orphans`, each run);
   boxes made by `min` alone are never listed. The same holds wherever a

@@ -645,6 +645,11 @@ ask_destroy() {
 # discards changes min has not saved. Returns min's exit status, or 4 when
 # min refused for want of a terminal to confirm unsaved changes on (a
 # client's call; on a terminal min asks itself).
+# NAME counts as gone (keys and records dropped, client_on_destroy run) only
+# when a min ls that succeeds no longer lists it. A failed min ls is
+# unknown: everything stays (ssh-config is not rewritten), with a warning,
+# and after a y the status is non-zero (min's own, or 1 when it was 0); a
+# later `destroy NAME` drops what was kept once min ls lists NAME no more.
 destroy_one() {
     r=0
     case $2 in
@@ -661,12 +666,24 @@ destroy_one() {
             fi ;;
         *) log "kept $1"; mkdir -p "$STATE/kept"; date +%s > "$STATE/kept/$1" ;;
     esac
-    if ! sess_exists "$1"; then
-        rm -rf "$(sess_dir "$1")" "$STATE/orphan/$1" "$STATE/kept/$1"
-        hook client_on_destroy "$1" || :
+    if ! listed=$(ls_lists "$1"); then
+        log "min ls failed, so whether $1 is gone is unknown; kept its keys"
+        case $2 in y|Y|yes|YES) [ "$r" != 0 ] || r=1 ;; esac
+        return "$r"
     fi
+    [ "$listed" = true ] || drop_gone "$1"
     ssh_config_write
     return "$r"
+}
+# ls_lists NAME: true or false, from a min ls that succeeds; fails with it.
+ls_lists() {
+    ll_j=$(min_ls 2>/dev/null) || return 1
+    printf '%s' "$ll_j" | jq -r --arg n "$1" 'any(.sessions[]; .name == $n)' 2>/dev/null
+}
+# drop_gone NAME: forget a box min no longer lists.
+drop_gone() {
+    rm -rf "$(sess_dir "$1")" "$STATE/orphan/$1" "$STATE/kept/$1"
+    hook client_on_destroy "$1" || :
 }
 
 # Sessions whose box serves an ssh connection right now, one per line: any
@@ -1101,7 +1118,17 @@ cmd_destroy() {
         esac
     fi
     [ -z "$force" ] || [ -n "$yes" ] || die "destroy: --force needs -y"
-    sess_exists "$name" || die "no session named $name"
+    if ! sess_exists "$name"; then
+        # keys a failed min ls kept (destroy_one) for a box now gone
+        if valid_name "$name" && [ -d "$(sess_dir "$name")" ]; then
+            listed=$(ls_lists "$name") || die "min ls failed; kept the keys of $name"
+            if [ "$listed" = false ]; then
+                drop_gone "$name"; ssh_config_write
+                log "$name is gone; removed its keys"; exit 0
+            fi
+        fi
+        die "no session named $name"
+    fi
     if [ -n "$ifidle" ] && ! gc_still_idle "$name"; then
         log "$name is in use now; not destroying"; exit 3
     fi

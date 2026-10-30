@@ -1,5 +1,7 @@
 #!/bin/sh
 # Stub for min: logs argv (multi-line args collapsed to <script>), serves fixtures.
+# $FIXTURES/ls.fail-from N: `min ls` fails from its Nth call on (ls.calls counts).
+# $FIXTURES/ls.fail-at N: only the Nth `min ls` fails.
 line="min"
 for a in "$@"; do
     case $a in
@@ -12,7 +14,13 @@ echo "$line" >> "$STUB_LOG"
 case "${1:-} ${2:-}" in
     "version "*) printf 'Client: minimal %s\nServer: minimald 0.7.0\n' "${STUB_MIN_VERSION:-0.7.0}" ;;
     "loadout list") cat "$FIXTURES/loadouts.txt" 2>/dev/null ;;
-    "ls --json") cat "$FIXTURES/sessions.json" ;;
+    "ls --json")
+        n=$(($(cat "$FIXTURES/ls.calls" 2>/dev/null || echo 0) + 1)); echo "$n" > "$FIXTURES/ls.calls"
+        if { [ -f "$FIXTURES/ls.fail-from" ] && [ "$n" -ge "$(cat "$FIXTURES/ls.fail-from")" ]; } \
+                || { [ -f "$FIXTURES/ls.fail-at" ] && [ "$n" -eq "$(cat "$FIXTURES/ls.fail-at")" ]; }; then
+            echo "error: could not reach minimald" >&2; exit 1
+        fi
+        cat "$FIXTURES/sessions.json" ;;
     "session activate")
         [ -f "$FIXTURES/sessions.after.json" ] && cp "$FIXTURES/sessions.after.json" "$FIXTURES/sessions.json"
         exit 0 ;;

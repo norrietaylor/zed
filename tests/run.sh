@@ -379,6 +379,62 @@ case_destroy_by_cwd() {
     assert_err_contains "no session for $P; pass NAME"
 }
 
+# A failed min ls after the answer is no proof the box is gone: its keys
+# and ssh stanza stay, with a warning. `n`: exit 0; `y` (min destroyed it,
+# then ls failed): exit 1, not success. min ls calls: sess_exists,
+# ask_destroy, then destroy_one's look, the third.
+case_destroy_ls_fails_keeps_keys() {
+    installed
+    rm -f "$FIXTURES/ls.calls"
+    printf 3 > "$FIXTURES/ls.fail-from"
+    run_stdin 'n
+' destroy alpha
+    assert_rc 0
+    assert_err_contains "kept alpha"
+    assert_err_contains "min ls failed, so whether alpha is gone is unknown; kept its keys"
+    assert_log_not_contains "min session destroy"
+    [ -d "$STATE/sessions/alpha" ] || fail "alpha's keys removed after n"
+    assert_file "$STATE/kept/alpha"
+    assert_file "$HOME/$CONF" "$(conf_expected alpha)"
+    rm -f "$FIXTURES/ls.calls"
+    run_stdin 'y
+' destroy alpha
+    assert_rc 1
+    assert_log_contains "min session destroy alpha"
+    assert_err_contains "min ls failed, so whether alpha is gone is unknown"
+    [ -d "$STATE/sessions/alpha" ] || fail "alpha's keys removed after a failed ls"
+    assert_file "$HOME/$CONF" "$(conf_expected alpha)"
+    # while min ls fails, destroy NAME says so and keeps them
+    run destroy alpha
+    assert_rc 1
+    assert_err_contains "min ls failed; kept the keys of alpha"
+    [ -d "$STATE/sessions/alpha" ] || fail "alpha's keys removed while min ls fails"
+    # once min ls works again, destroy NAME drops what was kept
+    rm -f "$FIXTURES/ls.fail-from"
+    run destroy alpha
+    assert_rc 0
+    assert_err_contains "alpha is gone; removed its keys"
+    assert_no_file "$STATE/sessions/alpha"
+    assert_file "$HOME/$CONF" "$(conf_expected)"
+    run destroy alpha
+    assert_rc 1
+    assert_err_contains "no session named alpha"
+}
+
+# Only destroy_one's look fails (ls.fail-at 2: sess_exists, then the look):
+# ssh-config is not rewritten either, though its own min ls would work.
+case_destroy_ls_fails_once_keeps_stanza() {
+    installed
+    rm -f "$FIXTURES/ls.calls"
+    printf 2 > "$FIXTURES/ls.fail-at"
+    run destroy -y alpha
+    assert_rc 1
+    assert_log_contains "min session destroy alpha"
+    assert_err_contains "min ls failed, so whether alpha is gone is unknown"
+    [ -d "$STATE/sessions/alpha" ] || fail "alpha's keys removed after a failed ls"
+    assert_file "$HOME/$CONF" "$(conf_expected alpha)"
+}
+
 # own NAME...: sessions this tool has prepared (a key dir), the only ones gc offers.
 own() { for o in "$@"; do mkdir -p "$STATE/sessions/$o"; done; }
 
@@ -515,6 +571,21 @@ q
     assert_err_contains "[y/N/q]"
     run gc --older-than x
     assert_rc 1
+}
+
+# gc goes through the same look: own_ls, ask_destroy, then destroy_one's.
+case_gc_ls_fails_keeps_keys() {
+    orphan_sessions
+    age gamma 9000
+    printf 3 > "$FIXTURES/ls.fail-from"
+    run_stdin 'y
+q
+' gc
+    assert_rc 1
+    assert_log_contains "min session destroy gamma"
+    assert_err_contains "min ls failed, so whether gamma is gone is unknown"
+    [ -d "$STATE/sessions/gamma" ] || fail "gamma's keys removed after a failed ls"
+    assert_file "$STATE/orphan/gamma"
 }
 
 # Another tool's box (no key dir here) is never listed or asked about.
@@ -2211,7 +2282,8 @@ open_needs_ssh_config
 open_rejects_non_directory_and_bad_name open_name_for_other_dir new_always_activates
 attach_launches_existing attach_picker_rejects_zero open_without_editor_fails_after_prepare open_editor_falls_back_to_app
 names_from_min
-destroy_asks_and_cleans_up destroy_by_cwd destroy_by_cwd_only_own destroy_picker_on_a_terminal in_use_reads_ps gc_lists_oldest_first_and_asks
+destroy_asks_and_cleans_up destroy_ls_fails_keeps_keys destroy_ls_fails_once_keeps_stanza destroy_by_cwd destroy_by_cwd_only_own destroy_picker_on_a_terminal in_use_reads_ps gc_lists_oldest_first_and_asks
+gc_ls_fails_keeps_keys
 gc_offers_only_own_sessions status_tracks_orphans status_table
 settings_untouched_before_opt_in settings_follow_sessions settings_take_over_old_opt_in config_zed_config_alias settings_sync_skipped_when_min_ls_fails
 config_print_and_bad_option config_and_doctor_keep_entries_when_min_ls_fails
@@ -2246,7 +2318,7 @@ completions_parse sessions_lists_names usage sshconfig_two_tools_coexist open_ke
 
 # Nothing under ~/.ssh unless the case opted in to ssh-config.
 ssh_untouched() {
-    case $1 in sshconfig_*|open_*|new_*|attach_*|names_*|destroy_asks*|settings_*|config_*|doctor_*|setup_*|blocks_only*|blocks_refreshed*|proxy_never*|prepare_rejects*|prepare_accepts*|stored_user*|safety_*|bad_session*) return 0 ;; esac
+    case $1 in sshconfig_*|open_*|new_*|attach_*|names_*|destroy_asks*|destroy_ls_fails*|settings_*|config_*|doctor_*|setup_*|blocks_only*|blocks_refreshed*|proxy_never*|prepare_rejects*|prepare_accepts*|stored_user*|safety_*|bad_session*) return 0 ;; esac
     [ ! -e "$T/home/.ssh" ] || fail "HOME/.ssh touched: $(find "$T/home/.ssh" | tr '\n' ' ')"
 }
 
