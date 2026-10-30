@@ -169,7 +169,10 @@ own surfaces, which `setup` wires: the Remote Projects list
   holds.
 - Restricted Mode (Zed source, v1.26.2): trust is stored per (ssh user,
   host, path) in Zed's SQLite db, read at startup and rewritten from memory,
-  so each new box asks once. The Mac decides itself
+  so each new box name asks once (a box recreated under the same name keeps
+  its trust). Trust also lets project settings start MCP servers, which run
+  on the Mac unless `"remote": true`: the box does not contain them. The
+  Mac decides itself
   (`worktree_store.rs` calls `can_trust` with the Mac's settings), so a
   `"linux"` settings override that reaches the box server does not stop the
   dialog. The only switch, `session.trust_all_worktrees`, also trusts every

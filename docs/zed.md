@@ -59,9 +59,12 @@ recreated under the same name heals itself.
   `"upload_binary_over_ssh": true` to the box's `ssh_connections` entry;
   min-zed keeps an entry of yours as you wrote it.
 - **Restricted Mode.** Each box is a new ssh host (`min-zed.NAME`), and
-  Zed opens a new host in Restricted Mode. Thus each new box asks one time.
-  Click Trust: language servers, project settings and MCP servers then
-  start, and they run in the box, not on the Mac. The box stays trusted.
+  Zed opens a new host in Restricted Mode. Thus each new box name asks one
+  time. Zed keeps the trust for the name, so a box made again with the same
+  name does not ask. Trust applies the project's `.zed/settings.json`, and
+  the language servers and MCP servers in it can then start. Language
+  servers run in the box. An MCP server runs on the Mac unless its entry
+  has `"remote": true`. Thus trust a box only when you trust its project.
   Zed 1.26.2 has no setting that trusts only some hosts.
   `"session": {"trust_all_worktrees": true}` stops the question, but it
   also trusts every folder on your Mac. min-zed does not set it.

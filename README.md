@@ -97,9 +97,10 @@ they print one line saying so. Run them from a local window, or press
 `` ⌃⌥` `` in a box window for a terminal on your Mac and use
 `min-zed` there.
 
-**Trust a new box once.** Zed opens each new box in Restricted Mode. Click
-Trust: the language servers it then starts run in the box. The box stays
-trusted. [Why each box asks](docs/zed.md#zed-and-a-box).
+**Trust a new box once.** Zed opens each new box name in Restricted Mode.
+Trust lets the project's settings start language servers (in the box) and
+MCP servers (on the Mac, unless set to remote). The name stays trusted.
+[Details](docs/zed.md#zed-and-a-box).
 
 **A box is a copy.** Edits inside it do not change the folder on your Mac.
 Get work out with git: commit and push from the box's terminal (`git` is in
