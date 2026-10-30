@@ -58,8 +58,16 @@ recreated under the same name heals itself.
   without outbound HTTPS can take it from the Mac instead: add
   `"upload_binary_over_ssh": true` to the box's `ssh_connections` entry;
   min-zed keeps an entry of yours as you wrote it.
-- **Restricted Mode.** Zed opens a host it has not seen in Restricted Mode.
-  Trust a new box once; it stays trusted.
+- **Restricted Mode.** Each box is a new ssh host (`min-zed.NAME`), and
+  Zed opens a new host in Restricted Mode. Thus each new box name asks one
+  time. Zed keeps the trust for the name, so a box made again with the same
+  name does not ask. Trust applies the project's `.zed/settings.json`, and
+  the language servers and MCP servers in it can then start. Language
+  servers run in the box. An MCP server runs on the Mac unless its entry
+  has `"remote": true`. Thus trust a box only when you trust its project.
+  Zed 1.26.2 has no setting that trusts only some hosts.
+  `"session": {"trust_all_worktrees": true}` stops the question, but it
+  also trusts every folder on your Mac. min-zed does not set it.
 - **Tasks run where the window is.** Global tasks run on the Mac in a local
   window, and in the box (bash, in `/workbench`) in a box window. The
   Minimal tasks therefore work from local windows; in a box window they
