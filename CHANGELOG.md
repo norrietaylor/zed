@@ -72,6 +72,10 @@ key instead.
 
 ### Fixed
 
+- `destroy` and `gc`: a failed `min ls` after the answer no longer counts as
+  the box being gone. Before, it removed the session's keys, refreshed
+  settings and dropped its ssh stanza even after an `n`; now everything is
+  kept, with a warning, and after a `y` the command exits 1.
 - `gc` offers only sessions min-zed has connected to (has keys for);
   sessions another tool or you created with `min` are never listed or asked
   about.

@@ -645,6 +645,10 @@ ask_destroy() {
 # discards changes min has not saved. Returns min's exit status, or 4 when
 # min refused for want of a terminal to confirm unsaved changes on (a
 # client's call; on a terminal min asks itself).
+# NAME counts as gone (keys and records dropped, client_on_destroy run) only
+# when a min ls that succeeds no longer lists it. A failed min ls is
+# unknown: everything stays, with a warning, and after a y the status is
+# non-zero (1 when min's was 0).
 destroy_one() {
     r=0
     case $2 in
@@ -661,9 +665,15 @@ destroy_one() {
             fi ;;
         *) log "kept $1"; mkdir -p "$STATE/kept"; date +%s > "$STATE/kept/$1" ;;
     esac
-    if ! sess_exists "$1"; then
-        rm -rf "$(sess_dir "$1")" "$STATE/orphan/$1" "$STATE/kept/$1"
-        hook client_on_destroy "$1" || :
+    if gone_ls=$(min_ls 2>/dev/null) \
+            && listed=$(printf '%s' "$gone_ls" | jq -r --arg n "$1" 'any(.sessions[]; .name == $n)' 2>/dev/null); then
+        if [ "$listed" = false ]; then
+            rm -rf "$(sess_dir "$1")" "$STATE/orphan/$1" "$STATE/kept/$1"
+            hook client_on_destroy "$1" || :
+        fi
+    else
+        log "min ls failed, so whether $1 is gone is unknown; kept its keys"
+        case $2 in y|Y|yes|YES) [ "$r" != 0 ] || r=1 ;; esac
     fi
     ssh_config_write
     return "$r"
