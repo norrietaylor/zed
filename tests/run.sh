@@ -1527,17 +1527,23 @@ case_setup_remove_stops_when_config_refuses() {
 }
 
 # gnu_env: an env on PATH that shell-quotes values like GNU coreutils 9.12
-# (tests/stubs/env), and two variables it would mangle: FOO with a space,
-# ML with a newline (an entry the env file cannot hold).
+# (tests/stubs/env), and three variables it or grep would mangle: FOO with a
+# space, ML with a newline (an entry the env file cannot hold), RAW not UTF-8
+# (GNU grep in a UTF-8 locale drops it).
 gnu_env() {
     mkdir -p "$T/gnu"; ln -sf "$STUBS/env" "$T/gnu/env"
-    PATH=$T/gnu:$PATH FOO='a b' ML="$(printf 'x\nBAD=1')"; export PATH FOO ML
+    PATH=$T/gnu:$PATH FOO='a b' ML="$(printf 'x\nBAD=1')" RAW="$(printf 'x\377y')"; export PATH FOO ML RAW
 }
 
-# assert_raw_env FILE: FOO raw, nothing of ML.
+# assert_raw_env FILE: FOO raw, nothing of ML, RAW kept. In the C locale:
+# grep elsewhere fails on RAW's byte.
 assert_raw_env() {
-    grep -qx 'FOO=a b' "$1" || fail "FOO not raw: $(grep FOO "$1")"
-    ! grep -Eq '^(ML|BAD)=' "$1" || fail "multi-line value written: $(grep -E '^(ML|BAD)=' "$1")"
+    (
+        LC_ALL=C; export LC_ALL
+        grep -qx 'FOO=a b' "$1" || fail "FOO not raw: $(grep FOO "$1")"
+        ! grep -Eq '^(ML|BAD)=' "$1" || fail "multi-line value written: $(grep -E '^(ML|BAD)=' "$1")"
+        grep -qx "RAW=$(printf 'x\377y')" "$1" || fail "RAW not kept: $(grep '^RAW=' "$1")"
+    )
 }
 
 loadout_hook() {

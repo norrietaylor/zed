@@ -124,7 +124,9 @@ put() {
 # neither is ever broken.
 # ~/.ssh/environment comes from `env -0`, one entry a line, any entry with a
 # newline dropped: sshd reads the file literally, and the box's GNU env
-# shell-quotes values with spaces.
+# shell-quotes values with spaces. tr and the greps run under LC_ALL=C: in a
+# UTF-8 locale GNU grep drops a line that is not valid UTF-8 (and every line
+# after it).
 # The rc line moves interactive shells that start in $HOME to /workbench.
 # A box with Minimal's claude package (`min add claude`: /usr/bin/claude, a
 # wrapper loading Minimal's Claude plugin) gets CLAUDE_CODE_EXECUTABLE in
@@ -162,7 +164,7 @@ while [ ! -s "$k" ] || [ ! -s "$k.pub" ]; do
   sleep 1; i=$((i + 1))
 done
 printf "%s\n" "$1" > "$a/authorized_keys.$$" && mv -f "$a/authorized_keys.$$" "$a/authorized_keys"
-env -0 | tr "\n\0" "\001\n" | grep -v "$(printf "\001")" | grep -E "^[A-Za-z_][A-Za-z0-9_]*=" | grep -Ev "^(TERM|PWD|OLDPWD|SHLVL|_|HOME|USER|LOGNAME|PATH|SSH_[A-Z_]*|PROMPT_COMMAND|MINIMAL_MOTD)=" > "$s/environment.$$" || true
+env -0 | LC_ALL=C tr "\n\0" "\001\n" | LC_ALL=C grep -v "$(printf "\001")" | LC_ALL=C grep -E "^[A-Za-z_][A-Za-z0-9_]*=" | LC_ALL=C grep -Ev "^(TERM|PWD|OLDPWD|SHLVL|_|HOME|USER|LOGNAME|PATH|SSH_[A-Z_]*|PROMPT_COMMAND|MINIMAL_MOTD)=" > "$s/environment.$$" || true
 c=${MIN_BOX_CLAUDE:-/usr/bin/claude}
 if [ -x "$c" ] && [ -z "${CLAUDE_CODE_EXECUTABLE:-}" ]; then echo "CLAUDE_CODE_EXECUTABLE=$c" >> "$s/environment.$$"; fi
 mv -f "$s/environment.$$" "$s/environment"
