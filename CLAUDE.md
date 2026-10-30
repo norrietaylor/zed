@@ -22,7 +22,7 @@ own surfaces, which `setup` wires: the Remote Projects list
 | `skills/`, `loadouts/zed/skills/` | Minimal's skills, vendored from gominimal/minimal-skills (MIT) at a pinned commit by `just skills`: the host ones (`setup` copies them into the Mac's `~/.agents/skills` (Zed's agent) and `~/.claude/skills`, marked `.min-zed-copy`, never over a dir with no `.min-*-copy` mark; one another min tool marked is shared, keeping its mark, and `--remove` deletes it only once no other mark is left) and `minimal-sandbox` (box only: the host ones teach commands a box lacks) |
 | `minimal.toml` | developing this repo in a box: session packages for `just check`; task `check` (`min task run check`) |
 | `justfile` | `check`, `install`/`uninstall` (= `setup`), `ssh-config`, `zed-config`, `skills` |
-| `tests/run.sh`, `tests/stubs/` | plain-sh tests over stub `min`, `zed`, `ssh`, `ssh-keygen`, `ps` (+ `find`/`mv` for PREP races) and a `tripwire` for bare GUI commands; `LONG_PREFIX=1` reruns them with a long host prefix; the destroy picker runs on a pty through `script(1)` (skipped without it) |
+| `tests/run.sh`, `tests/stubs/` | plain-sh tests over stub `min`, `zed`, `ssh`, `ssh-keygen`, `ps` (+ `find`/`mv` for PREP races, `env` quoting like the box's) and a `tripwire` for bare GUI commands; `LONG_PREFIX=1` reruns them with a long host prefix; the destroy picker runs on a pty through `script(1)` (skipped without it) |
 | `docs/` | user docs (being rewritten for 0.2.0), `public/` marks and badge |
 
 ## The Zed UI (what `config` writes)
@@ -202,6 +202,11 @@ own surfaces, which `setup` wires: the Remote Projects list
   curl, python3, zsh; `sshd` at `/usr/sbin/sshd`.
 - sshd scrubs the environment: PREP writes `~/.ssh/environment` (filtering
   `PROMPT_COMMAND`/`MINIMAL_MOTD`) and sshd runs with `PermitUserEnvironment=yes`.
+  sshd reads the file literally, and the box's GNU `env` (coreutils 9.12)
+  shell-quotes values with a space or quote, so PREP and the loadout hook
+  write it from `env -0` (one entry a line; a value with a newline is left
+  out). Not awk with a NUL RS: macOS awk stops after the first record, and
+  the tests run PREP on the Mac.
 - In the box, the host key and `authorized_keys` live in `~/.ssh/min-zed/`.
 - Without a terminal, `min session destroy` refuses a box with unsaved
   changes ("refusing to destroy the session without confirmation; pass

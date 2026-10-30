@@ -81,6 +81,12 @@ key instead.
 - `gc` offers only sessions min-zed has connected to (has keys for);
   sessions another tool or you created with `min` are never listed or asked
   about.
+- The box's sshd environment file (`~/.ssh/environment`, written by PREP
+  and the loadout hook) is written from `env -0`, so values keep no quotes.
+  The box's GNU `env` shell-quotes a value with a space or quote
+  (`FOO='a b'`), and sshd reads the file literally: such variables reached
+  ssh shells with the quotes in them, and Minimal's banner did not show. A
+  value with a newline is left out (the file cannot hold one).
 
 ## [0.1.0] - 2026-10-16
 

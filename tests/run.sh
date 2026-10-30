@@ -1526,6 +1526,20 @@ case_setup_remove_stops_when_config_refuses() {
     assert_no_file "$TASKS"
 }
 
+# gnu_env: an env on PATH that shell-quotes values like GNU coreutils 9.12
+# (tests/stubs/env), and two variables it would mangle: FOO with a space,
+# ML with a newline (an entry the env file cannot hold).
+gnu_env() {
+    mkdir -p "$T/gnu"; ln -sf "$STUBS/env" "$T/gnu/env"
+    PATH=$T/gnu:$PATH FOO='a b' ML="$(printf 'x\nBAD=1')"; export PATH FOO ML
+}
+
+# assert_raw_env FILE: FOO raw, nothing of ML.
+assert_raw_env() {
+    grep -qx 'FOO=a b' "$1" || fail "FOO not raw: $(grep FOO "$1")"
+    ! grep -Eq '^(ML|BAD)=' "$1" || fail "multi-line value written: $(grep -E '^(ML|BAD)=' "$1")"
+}
+
 loadout_hook() {
     awk -v want="$1" -v q="'''" '$0 == "on_activate.value = " q { on = (n++ == want); next }
         $0 == q { on = 0; next } on' "$ROOT/loadouts/zed.toml"
@@ -1538,6 +1552,13 @@ case_loadout_rc_line_once() {
     [ "$(grep -c 'min:workbench' "$B/.bashrc")" = 1 ] || fail ".bashrc: $(cat "$B/.bashrc")"
     [ "$(grep -c 'min:workbench' "$B/.zshrc")" = 1 ] || fail ".zshrc: $(cat "$B/.zshrc")"
     assert_file "$B/.bash_profile"
+}
+
+# The hook writes ~/.ssh/environment raw, though the box's env quotes values.
+case_loadout_env_values_raw() {
+    B=$T/box; mkdir -p "$B"; gnu_env
+    HOME=$B sh -c "$(loadout_hook 0)" < /dev/null
+    assert_raw_env "$B/.ssh/environment"
 }
 
 # The loadout copies minimal-sandbox for Claude Code in the box (Zed's agent
@@ -1990,6 +2011,14 @@ case_prep_claude_executable_only_with_claude() {
     [ "$(grep '^CLAUDE_CODE_EXECUTABLE=' "$T/box/.ssh/environment")" = CLAUDE_CODE_EXECUTABLE=/opt/mine ] || fail "env: $(cat "$T/box/.ssh/environment")"
 }
 
+# PREP writes ~/.ssh/environment raw (sshd reads it literally), though the
+# box's env quotes values.
+case_prep_env_values_raw() {
+    gnu_env
+    run_prep "$T/p1" || fail "PREP failed: $(cat "$T/p1.err")"
+    assert_raw_env "$T/box/.ssh/environment"
+}
+
 case_prep_waiter_keeps_lock_it_does_not_own() {
     mkdir -p "$T/box/$BOXD/.keygen"
     MIN_KEYGEN_WAIT=2 run_prep "$T/p1"
@@ -2297,7 +2326,7 @@ blocks_refreshed_when_edited blocks_users_entry_in_our_array_kept blocks_refuse_
 doctor_rows doctor_min_version
 new_empty_no_window attach_no_window destroy_if_idle destroy_unsaved_needs_force status_json setup_installs_follows_and_removes
 setup_remove_stops_when_config_refuses
-loadout_rc_line_once loadout_skill_only_for_claude setup_shares_skills_with_other_tools setup_through_link
+loadout_rc_line_once loadout_env_values_raw loadout_skill_only_for_claude setup_shares_skills_with_other_tools setup_through_link
 sshconfig_install_creates_include_and_stanza sshconfig_remove_restores_original
 sshconfig_coexists_with_another_tool sshconfig_keeps_symlinked_config sshconfig_print_touches_nothing
 sshconfig_destroy_drops_stanza sshconfig_stale_and_invalid_dirs_skipped sshconfig_real_ssh_resolves
@@ -2309,7 +2338,7 @@ proxy_prepares_then_execs_sshd proxy_never_touches_settings_or_editor proxy_fail
 proxy_missing_takes_no_host proxy_log_capped_and_private
 proxy_prepare_write_failure prepare_writes_atomically prepare_rejects_bad_facts prepare_accepts_valid_facts
 prepare_errors_strip_control_bytes stored_user_checked_on_read proxy_rechecks_stored_paths
-prep_extracts_and_prints_facts prep_claude_executable_only_with_claude
+prep_extracts_and_prints_facts prep_claude_executable_only_with_claude prep_env_values_raw
 prep_waiter_keeps_lock_it_does_not_own prep_breaks_stale_lock prep_concurrent_runs_agree_on_host_key
 prep_regenerates_half_pair prep_keygen_failure_releases_lock prep_stale_lock_stress
 open_default_loadouts_toml_forms sshconfig_lock_held_waits_then_fails

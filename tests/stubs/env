@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stub for env, as GNU coreutils 9.12 in a box prints it: plain `env`
+# shell-quotes a value with a space or quote (FOO='a b'), which sshd would
+# read literally from ~/.ssh/environment; `env -0` prints raw NUL-separated
+# entries. Linked into a case's PATH as `env`.
+if [ "${1:-}" = -0 ]; then exec /usr/bin/env "$@"; fi
+# shellcheck disable=SC2016  # sed script, literal
+/usr/bin/env "$@" | sed -e "/^[^=]*=.*[ '\"]/{s/'/'\\\\''/g;s/=/='/;s/\$/'/;}"
