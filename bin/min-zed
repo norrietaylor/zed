@@ -1120,9 +1120,12 @@ cmd_destroy() {
     [ -z "$force" ] || [ -n "$yes" ] || die "destroy: --force needs -y"
     if ! sess_exists "$name"; then
         # keys a failed min ls kept (destroy_one) for a box now gone
-        if valid_name "$name" && [ -d "$(sess_dir "$name")" ] && [ "$(ls_lists "$name")" = false ]; then
-            drop_gone "$name"; ssh_config_write
-            log "$name is gone; removed its keys"; exit 0
+        if valid_name "$name" && [ -d "$(sess_dir "$name")" ]; then
+            listed=$(ls_lists "$name") || die "min ls failed; kept the keys of $name"
+            if [ "$listed" = false ]; then
+                drop_gone "$name"; ssh_config_write
+                log "$name is gone; removed its keys"; exit 0
+            fi
         fi
         die "no session named $name"
     fi

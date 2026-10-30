@@ -404,6 +404,11 @@ case_destroy_ls_fails_keeps_keys() {
     assert_err_contains "min ls failed, so whether alpha is gone is unknown"
     [ -d "$STATE/sessions/alpha" ] || fail "alpha's keys removed after a failed ls"
     assert_file "$HOME/$CONF" "$(conf_expected alpha)"
+    # while min ls fails, destroy NAME says so and keeps them
+    run destroy alpha
+    assert_rc 1
+    assert_err_contains "min ls failed; kept the keys of alpha"
+    [ -d "$STATE/sessions/alpha" ] || fail "alpha's keys removed while min ls fails"
     # once min ls works again, destroy NAME drops what was kept
     rm -f "$FIXTURES/ls.fail-from"
     run destroy alpha
