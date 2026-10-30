@@ -404,6 +404,30 @@ case_destroy_ls_fails_keeps_keys() {
     assert_err_contains "min ls failed, so whether alpha is gone is unknown"
     [ -d "$STATE/sessions/alpha" ] || fail "alpha's keys removed after a failed ls"
     assert_file "$HOME/$CONF" "$(conf_expected alpha)"
+    # once min ls works again, destroy NAME drops what was kept
+    rm -f "$FIXTURES/ls.fail-from"
+    run destroy alpha
+    assert_rc 0
+    assert_err_contains "alpha is gone; removed its keys"
+    assert_no_file "$STATE/sessions/alpha"
+    assert_file "$HOME/$CONF" "$(conf_expected)"
+    run destroy alpha
+    assert_rc 1
+    assert_err_contains "no session named alpha"
+}
+
+# Only destroy_one's look fails (ls.fail-at 2: sess_exists, then the look):
+# ssh-config is not rewritten either, though its own min ls would work.
+case_destroy_ls_fails_once_keeps_stanza() {
+    installed
+    rm -f "$FIXTURES/ls.calls"
+    printf 2 > "$FIXTURES/ls.fail-at"
+    run destroy -y alpha
+    assert_rc 1
+    assert_log_contains "min session destroy alpha"
+    assert_err_contains "min ls failed, so whether alpha is gone is unknown"
+    [ -d "$STATE/sessions/alpha" ] || fail "alpha's keys removed after a failed ls"
+    assert_file "$HOME/$CONF" "$(conf_expected alpha)"
 }
 
 # own NAME...: sessions this tool has prepared (a key dir), the only ones gc offers.
@@ -2253,7 +2277,7 @@ open_needs_ssh_config
 open_rejects_non_directory_and_bad_name open_name_for_other_dir new_always_activates
 attach_launches_existing attach_picker_rejects_zero open_without_editor_fails_after_prepare open_editor_falls_back_to_app
 names_from_min
-destroy_asks_and_cleans_up destroy_ls_fails_keeps_keys destroy_by_cwd destroy_by_cwd_only_own destroy_picker_on_a_terminal in_use_reads_ps gc_lists_oldest_first_and_asks
+destroy_asks_and_cleans_up destroy_ls_fails_keeps_keys destroy_ls_fails_once_keeps_stanza destroy_by_cwd destroy_by_cwd_only_own destroy_picker_on_a_terminal in_use_reads_ps gc_lists_oldest_first_and_asks
 gc_ls_fails_keeps_keys
 gc_offers_only_own_sessions status_tracks_orphans status_table
 settings_untouched_before_opt_in settings_follow_sessions settings_take_over_old_opt_in config_zed_config_alias settings_sync_skipped_when_min_ls_fails
