@@ -2,6 +2,8 @@
 # Stub for min: logs argv (multi-line args collapsed to <script>), serves fixtures.
 # $FIXTURES/ls.fail-from N: `min ls` fails from its Nth call on (ls.calls counts).
 # $FIXTURES/ls.fail-at N: only the Nth `min ls` fails.
+# $FIXTURES/ls.junk: `min ls` exits 0 and prints that file instead.
+# exec and destroy take a session's id or name (min resolves an id first).
 line="min"
 for a in "$@"; do
     case $a in
@@ -20,6 +22,8 @@ case "${1:-} ${2:-}" in
                 || { [ -f "$FIXTURES/ls.fail-at" ] && [ "$n" -eq "$(cat "$FIXTURES/ls.fail-at")" ]; }; then
             echo "error: could not reach minimald" >&2; exit 1
         fi
+        # ls.junk: min exits 0 but prints this, not a session list
+        if [ -f "$FIXTURES/ls.junk" ]; then cat "$FIXTURES/ls.junk"; exit 0; fi
         cat "$FIXTURES/sessions.json" ;;
     "session activate")
         [ -f "$FIXTURES/sessions.after.json" ] && cp "$FIXTURES/sessions.after.json" "$FIXTURES/sessions.json"
@@ -42,7 +46,7 @@ case "${1:-} ${2:-}" in
             echo "error: refusing to destroy the session without confirmation; pass --force" >&2; exit 1
         fi
         if [ "$rc" = 0 ]; then
-            jq --arg n "$3" '.sessions |= map(select(.name != $n))' "$FIXTURES/sessions.json" > "$FIXTURES/sessions.tmp" \
+            jq --arg n "$3" '.sessions |= map(select(.name != $n and .id != $n))' "$FIXTURES/sessions.json" > "$FIXTURES/sessions.tmp" \
                 && mv "$FIXTURES/sessions.tmp" "$FIXTURES/sessions.json"
         fi
         exit "$rc" ;;

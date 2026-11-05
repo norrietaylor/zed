@@ -15,14 +15,14 @@ own surfaces, which `setup` wires: the Remote Projects list
 | File | Role |
 |---|---|
 | `bin/min-zed` | tool constants, then the transport/ssh/session plumbing, then the client layer, whose first block holds every editor-specific constant |
-| plumbing | transport, PREP/prepare, `stored_path`, ssh options and stanzas, `ssh-config`, `_proxy`, `ssh`, naming, `pick_session`, `activate_session`, `destroy_one`, `in_use_names`/`box_in_use`, `track_orphans`, `default_loadouts`, the ssh-config record, report helpers; editor-neutral, reaching the client layer only through its hooks |
+| plumbing | transport, box ids (`stored_id`, `pick_id`, `box_id`, `need_box`, `own_filter`, `id_field`), PREP/prepare, `stored_path`, ssh options and stanzas, `ssh-config`, `_proxy`, `ssh`, naming, `pick_session`, `activate_session`, `destroy_one`, `in_use_names`/`box_in_use`, `track_orphans`, `default_loadouts`, the ssh-config record, report helpers; editor-neutral, reaching the client layer only through its hooks |
 | client layer | `open`/`new`/`attach` (session, stanza, settings, `zed ssh://…` unless `--no-window`; `new --empty`), `destroy` (`--if-idle`; no NAME: the cwd's own box, else on a terminal the picker), `gc`, `status` (`--json`), `doctor`, `completions`, `config` (alias `zed-config`), `setup`, hidden `_sessions`; hooks `client_on_connect` and `client_on_destroy` (settings sync) |
 | `bin/min-zed-config` | python3 merger for three JSONC files in `~/.config/zed`: `settings.json` (`ssh_connections` entries for live sessions, edited in place), `tasks.json` and `keymap.json` (a marked block at the top of the array: the Minimal tasks, the local-terminal key); `--install`, `--sync NAME...`, `--remove`, `--doctor`, `--dry-run` |
 | `loadouts/zed.toml`, `loadouts/zed/` | `openssh curl rsync xxhash git`; sshd env prep; `min:workbench` rc line; a patch copying `zed/skills/minimal-sandbox` to `~/.claude/skills` in the box. `setup` copies `zed/` beside the linked toml: `$LOADOUT_ROOT` must be a real directory |
 | `skills/`, `loadouts/zed/skills/` | Minimal's skills, vendored from gominimal/minimal-skills (MIT) at a pinned commit by `just skills`: the host ones (`setup` copies them into the Mac's `~/.agents/skills` (Zed's agent) and `~/.claude/skills`, marked `.min-zed-copy`, never over a dir with no `.min-*-copy` mark; one another min tool marked is shared, keeping its mark, and `--remove` deletes it only once no other mark is left) and `minimal-sandbox` (box only: the host ones teach commands a box lacks) |
 | `minimal.toml` | developing this repo in a box: session packages for `just check`; task `check` (`min task run check`) |
 | `justfile` | `check`, `install`/`uninstall` (= `setup`), `ssh-config`, `zed-config`, `skills` |
-| `tests/run.sh`, `tests/stubs/` | plain-sh tests over stub `min`, `zed`, `ssh`, `ssh-keygen`, `ps` (+ `find`/`mv` for PREP races) and a `tripwire` for bare GUI commands; `LONG_PREFIX=1` reruns them with a long host prefix; the destroy picker runs on a pty through `script(1)` (skipped without it) |
+| `tests/run.sh`, `tests/stubs/` | plain-sh tests over stub `min`, `zed`, `ssh`, `ssh-keygen`, `ps` (+ `find`/`mv` for PREP races) and a `tripwire` for bare GUI commands; `LONG_PREFIX=1` reruns them with a long host prefix; the destroy picker runs on a pty through `script(1)` (skipped without it); fixture ids are UUIDs (`ID_A`, `id_of NAME`), and the `ids_*` cases cover box ids |
 | `docs/` | user docs (being rewritten for 0.2.0), `public/` marks and badge |
 
 ## The Zed UI (what `config` writes)
@@ -66,13 +66,15 @@ own surfaces, which `setup` wires: the Remote Projects list
 - Host alias is `min-zed.NAME` (`HOST_PREFIX`); nothing hard-codes the
   prefix length (the long-prefix test run guards it).
 - `prepare` re-pins the host key and re-pushes the public key on every
-  `open`/`attach`/`ssh`/`_proxy`, so a recreated session self-heals.
+  `open`/`attach`/`ssh`/`_proxy`, so a box min-zed recreated self-heals;
+  it never replaces a recorded id with another.
   `_proxy` always runs `prepare` and writes nothing to stdout before `exec`
   (stdout is the SSH byte stream). `_proxy` and `prepare` never call client
   hooks, never touch Zed's files.
 - `ssh-config` is an opt-in gate: nothing under `~/.ssh` is touched until it
   has run. `ssh-config --remove` leaves `~/.ssh/config` byte-identical to
-  before install; `--print` writes nothing. Other tools' Include lines are
+  before install; `--print` writes nothing (not even a legacy key dir's
+  adopted id: `PICK_NOADOPT`). Other tools' Include lines are
   never touched.
 - `config` is the same kind of gate for Zed's files: `--sync` is a no-op
   until `config` has run (`STATE/settings-installed`), and `--sync` (from
@@ -95,6 +97,9 @@ own surfaces, which `setup` wires: the Remote Projects list
   found and deletes a file it created (`STATE/<file>-created`) once empty; a
   file that does not parse (or is not UTF-8, or has the wrong top level) is
   refused, and then none of the three is written. Settings sync is skipped when `min ls` fails.
+  `ssh_connections` stays keyed by host alias (`min-zed.NAME`, nickname
+  NAME), never by id; it lists only own boxes (`prepared_live`:
+  `own_filter`, without adopting).
 - The host key is pinned (`StrictHostKeyChecking=yes`); never `accept-new`.
 - Agent and X11 forwarding stay off on every client path: one option list
   (`ssh_common`) feeds both the stanza and `ssh_opts`.
@@ -105,23 +110,72 @@ own surfaces, which `setup` wires: the Remote Projects list
 - `gc` and `destroy` never destroy without an explicit y; `-y` is the only
   way past `destroy`'s question.
 - A box is gone (keys, records and stanza dropped, `client_on_destroy` run
-  by `destroy_one`) only when a successful `min ls` no longer lists it; a
+  by `destroy_one`) only when a successful `min ls` no longer lists its id; a
   failed `min ls` keeps everything (ssh-config not rewritten), warns, and
   after a y exits non-zero; `destroy NAME` drops what was kept once a
-  successful `min ls` no longer lists NAME.
-- `gc` offers only own sessions (`own_ls`: a key dir `STATE/sessions/NAME`),
+  successful `min ls` no longer lists the recorded id, even while another
+  box holds the name (never touching that box); for a key dir with no id,
+  once no box is named NAME. `min_ls` fails unless its output has a
+  `.sessions` array, so junk on exit 0 is a failed `min ls`, never "no box";
+  `own_filter` fails with its jq, and a box listed under NAME with no
+  usable id (`pick_id` 7) is "no id to trust", never "none".
+- Every min call aimed at one box passes its id, never its name (min 0.8
+  resolves a name to whichever box holds it): `session exec` (prepare,
+  `_proxy`'s exec, `proxy_command`) and `session destroy` (`destroy_one`).
+  The id is `STATE/sessions/NAME/id` (`activate_session`: the one id new in
+  `min ls`, named NAME with `-n`, else for PATH, a null name refused;
+  `prepare` writes it with the facts, and refuses a bad `id` file or a
+  different id, never writing over either), checked against `ID_ERE` on every read (`stored_id`, which
+  also refuses a NAME that is no session name) before it reaches a command
+  line or a stanza. `pick_id`/`box_id` resolve NAME: own (the recorded id,
+  listed under NAME); a key dir with no `id` adopts the one box named NAME
+  (and writes it only on a connect: `attach`/`ssh`/`_proxy` through
+  `box_id`/`need_box`, `open` through `prepare` once the project checks
+  out; `own_filter` always runs `pick_id` under `PICK_NOADOPT=1`, so no
+  list adopts: open's reuse, the pickers, the cwd lookup, gc, status,
+  completions, stanzas, `prepared_live`; `cmd_open`, `cmd_destroy`,
+  `ssh-config`, `config`, `setup` and `doctor` set it too). `destroy`
+  never writes an id: an explicit `destroy NAME` reaches the one box of the
+  name by its id without recording it, and a NAME the cwd lookup or the
+  picker chose is refused unless its id is recorded ("NAME has no recorded
+  box id yet; …"). `gc` never adopts or destroys a key dir with no `id`: it
+  lists it ("no id recorded (attach NAME once)") without asking. `status
+  --json` gives `recorded`. In-use checks of own boxes go by name and id
+  (gc rows, `gc_still_idle NAME ID`, `st_used`, `track_orphans`). `min_ls` needs exactly one JSON value whose
+  `.sessions` is an array of objects; a jq failure in `pick_id` is status 8
+  ("could not read min ls"), never "none"; `pick_id` returns 1 for a NAME
+  that is no session name before touching `sess_dir`; several
+  boxes named NAME, none recorded, a bad `id` file, or a listed box with no
+  usable id: no id (`box_id` status 2, `BWHY`), so
+  an explicit NAME dies saying why, `doctor` warns, it is not own and gets
+  no stanza or `ssh_connections` entry; never a by-name call. A recorded id
+  is never traded for a box found by name: ours gone (id unlisted;
+  `pick_id` 5) with another box named NAME is `box_id` status 5, "your box
+  NAME is gone": `destroy NAME` drops only our keys and records, everything
+  else refuses; ours listed under another name or none (`pick_id` 6) is
+  refused everywhere. A NAME chosen from the own list (the cwd, the
+  pickers) resolves with `own`. A failed `min ls` keeps every stanza but a
+  bad-id one. An explicit NAME that is not own and has no recorded id
+  reaches the one box of that name (`attach`, `ssh`, `open -n`, `destroy`),
+  refused when several share it; `_proxy NAME` only an own box, or the one
+  box of that name when there is no key dir at all (a stanza of a box of
+  ours that is gone never reaches the box that took its name). Helpers
+  reading one session (`id_field`, `ls_lists`) select by id.
+- `gc` offers only own sessions (`own_ls`: a key dir `STATE/sessions/NAME`
+  whose recorded id `min ls` lists under NAME; `status --json` gives `id`),
   and `gc`/`status` date only those in `orphan/` (`track_orphans`, each run);
   boxes made by `min` alone are never listed. The same holds wherever a
   session is chosen for the user: `open`'s reuse of a live session for PATH,
   `destroy`'s cwd lookup and its picker, the `attach` picker and `_sessions`
-  (completions). Only an explicit NAME (`attach NAME`, `destroy NAME`,
-  `open -n NAME`) may reach another tool's box.
+  (completions). Only an explicit NAME (`attach NAME`, `ssh NAME`,
+  `destroy NAME`, `open -n NAME`) may reach another tool's box.
 - `destroy` without NAME: exactly one own session for the cwd is it;
   otherwise, on a terminal (a Zed task), the own-session picker; without a
   terminal, or with no own session at all, the errors ("no session for DIR;
   pass NAME", "several sessions for DIR: …; pass NAME").
-- In use = some host process runs `min session exec NAME ... sshd` (any ssh
-  client's connection). Never contact a box without such a live process: a
+- In use = some host process runs `min session exec X ... sshd` (any ssh
+  client's connection); X is an id or a bare name (connections from before
+  ids, other tools), and every check of an own box asks for both. Never contact a box without such a live process: a
   connect starts a stopped box.
 - `gc` re-checks `gc_still_idle` before each question; `destroy --if-idle`
   re-checks it too (exit 3 when in use); without a terminal, unsaved changes
@@ -140,6 +194,14 @@ own surfaces, which `setup` wires: the Remote Projects list
 
 ## External facts that bite
 
+- min 0.8.0-dev.381 ([gominimal/minimal#2756](https://github.com/gominimal/minimal/pull/2756),
+  BOX-004/005): a session name is an alias many boxes may share. A
+  stopped box keeps its name, and `min ls` still lists it, but it does not
+  stop a new box from taking the name; only a running box (or a resume in
+  flight) does (minimald's `claim_name`/`running_name_holder`). A name
+  resolves to the running box, else the latest. `session exec`, `attach`, `destroy`, `rename` and `policy` take a
+  full session id first (`SessionLookup::parse`), and `min ls --json` gives
+  each session's `id` (lowercase hex UUID) and `name` (which may be null).
 - `min` is a zsh function on the host; `MIN_BIN` is resolved to an absolute
   path and baked into each stanza (Zed spawns ssh with the launchd PATH).
 - Without `zed` on PATH, `bin/min-zed` uses the app's own CLI
